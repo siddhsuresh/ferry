@@ -1,0 +1,19 @@
+[package]
+name = "keel-ffi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger.workspace = true
+keel-mtp.workspace = true
+keel-proto.workspace = true
+keel-usb.workspace = true
+keel-vfs.workspace = true
+libc.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+name = "keel"

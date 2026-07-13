@@ -1,0 +1,10 @@
+[package]
+name = "keel-vfs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+keel-mtp.workspace = true
+keel-proto.workspace = true
+keel-usb.workspace = true
+log.workspace = true

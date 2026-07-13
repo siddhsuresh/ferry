@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/keel-proto",
+    "crates/keel-usb",
+    "crates/keel-mtp",
+    "crates/keel-vfs",
+    "crates/keel-ffi",
+    "crates/keel-probe",
+    "crates/keel-conformance",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+keel-proto = { path = "crates/keel-proto" }
+keel-usb = { path = "crates/keel-usb" }
+keel-mtp = { path = "crates/keel-mtp" }
+keel-vfs = { path = "crates/keel-vfs" }
+nusb = "0.2"
+futures = "0.3"
+futures-timer = "3.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+core-foundation = "0.10"
+
+# The FFI dylib must never abort across the C boundary; exports use
+# catch_unwind, so unwinding stays enabled even in release.
+[profile.release]
+panic = "unwind"
+lto = true

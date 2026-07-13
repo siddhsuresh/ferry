@@ -129,6 +129,92 @@ public actor KeelEngine {
 
     public var supportsThumbnails: Bool { library.supportsThumbnails }
 
+    /// Streams a directory walk in batches: each yielded `[KeelFile]` is a chunk
+    /// of entries as they're read, so the UI can paint a large folder
+    /// progressively. Falls back to a single-shot `list()` when the loaded
+    /// kernel lacks WalkStream. MTP is serial, so this isn't faster — it just
+    /// delivers as it goes.
+    public func listStream(
+        storageId: UInt32, path: String, recursive: Bool = false,
+        skipHiddenFiles: Bool = true
+    ) -> AsyncThrowingStream<[KeelFile], Error> {
+        AsyncThrowingStream { continuation in
+            let producer = Task {
+                await self.runWalkStream(
+                    storageId: storageId, path: path, recursive: recursive,
+                    skipHiddenFiles: skipHiddenFiles, into: continuation)
+            }
+            continuation.onTermination = { _ in producer.cancel() }
+        }
+    }
+
+    private func runWalkStream(
+        storageId: UInt32, path: String, recursive: Bool, skipHiddenFiles: Bool,
+        into continuation: AsyncThrowingStream<[KeelFile], Error>.Continuation
+    ) async {
+        guard library.supportsWalkStream else {
+            // Fallback: one blocking list, delivered as a single batch.
+            do {
+                let all = try await list(
+                    storageId: storageId, path: path,
+                    skipHiddenFiles: skipHiddenFiles, recursive: recursive)
+                if !all.isEmpty { continuation.yield(all) }
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+            return
+        }
+
+        await acquireFFI()
+        defer {
+            KeelCallbackSlots.clear()
+            releaseFFI()
+        }
+
+        let json = Self.encodeJSON([
+            "storageId": storageId,
+            "fullPath": path,
+            "recursive": recursive,
+            "skipDisallowedFiles": false,
+            "skipHiddenFiles": skipHiddenFiles,
+        ])
+        let decoder = JSONDecoder()
+
+        await withCheckedContinuation { (finished: CheckedContinuation<Void, Never>) in
+            let done = OnceFlag()
+            KeelCallbackSlots.install(
+                done: { payload in
+                    if let envelope = try? decoder.decode(
+                        KeelEnvelope<KeelJSONValue>.self, from: Data(payload.utf8)),
+                        let failure = envelope.failure
+                    {
+                        continuation.finish(throwing: failure)
+                    } else {
+                        continuation.finish()
+                    }
+                    if done.set() { finished.resume() }
+                },
+                preprocess: nil,
+                progress: { payload in
+                    // Each progress callback is one batch: a JSON array of files.
+                    guard
+                        let envelope = try? decoder.decode(
+                            KeelEnvelope<[KeelFile]>.self, from: Data(payload.utf8))
+                    else { return }
+                    if let failure = envelope.failure {
+                        continuation.finish(throwing: failure)
+                        if done.set() { finished.resume() }
+                    } else if let batch = envelope.data, !batch.isEmpty {
+                        continuation.yield(batch)
+                    }
+                }
+            )
+
+            ffiQueue.async { _ = self.library.rawWalkStream(json: json) }
+        }
+    }
+
     /// Device-generated thumbnail (JPEG bytes) for a file, or nil when the
     /// object has none / the kernel doesn't support GetThumb. Best-effort — it
     /// swallows errors so a broken thumbnail never disrupts browsing.

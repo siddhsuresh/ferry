@@ -379,6 +379,35 @@ pub(crate) fn walk(
     })
 }
 
+/// Streaming variant of [`walk`]: instead of collecting the whole tree and
+/// returning it, invoke `on_entry` for each file as it is read, so the caller
+/// (abi.rs) can deliver entries to the UI in batches while the walk is still
+/// running. Holds the device session for the walk's duration, same as `walk`.
+pub(crate) fn walk_streaming(
+    storage_id: u32,
+    full_path: &str,
+    recursive: bool,
+    skip_disallowed_files: bool,
+    skip_hidden_files: bool,
+    on_entry: &mut dyn FnMut(&FileInfo),
+) -> Result<(), KernelError> {
+    with_session(false, |s| {
+        keel_vfs::walk::walk(
+            s,
+            storage_id,
+            full_path,
+            recursive,
+            skip_disallowed_files,
+            skip_hidden_files,
+            &mut |_object_id, fi| {
+                on_entry(fi);
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })
+}
+
 /// Upload files to the device. The preprocess/progress callbacks and the cancel seam
 /// are built by abi.rs (they drive the 500 ms sampler); this just verifies the session
 /// and forwards to the vfs upload. The returned counts are discarded.

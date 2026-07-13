@@ -237,6 +237,10 @@ public final class DeviceSession {
     private var engine: KeelEngine?
     private var isAttemptingConnect = false
     private var indexedStorageID: UInt32?
+    // Bumped on every navigate; a streaming walk stops feeding `files` once a
+    // newer navigate supersedes it, so fast folder-switching can't interleave
+    // two folders' batches into one list.
+    private var navToken = 0
 
     // Thumbnails: objectId → loaded image, so a tile that scrolls back into
     // view doesn't re-fetch over USB. Cleared on disconnect.
@@ -392,17 +396,27 @@ public final class DeviceSession {
 
     public func navigate(to newPath: String) async {
         guard let engine, let sid = selectedStorageID else { return }
+        navToken += 1
+        let token = navToken
+        // Stream the walk so a big folder paints as it loads: clear, show the
+        // spinner until the first batch, then append batches into `files`.
         isListing = true
-        defer { isListing = false }
+        files = []
+        path = newPath
+        lastError = nil
+        defer { if token == navToken { isListing = false } }
         do {
-            files = try await engine.list(storageId: sid, path: newPath)
-            path = newPath
-            lastError = nil
+            for try await batch in await engine.listStream(storageId: sid, path: newPath) {
+                // A newer navigate started — stop feeding this (stale) folder.
+                guard token == navToken else { break }
+                files.append(contentsOf: batch)
+                isListing = false  // first batch arrived → show content, not spinner
+            }
         } catch let error as KeelError where error.isDeviceNotFound {
             phase = .idle
             lastError = "Phone disconnected."
         } catch {
-            lastError = "\(error)"
+            if token == navToken { lastError = "\(error)" }
         }
     }
 
@@ -577,10 +591,21 @@ public final class DeviceSession {
         guard let engine, let sid = selectedStorageID, !isIndexing else { return }
         isIndexing = true
         defer { isIndexing = false }
+        // Stream the whole-phone recursive walk so search results start
+        // appearing while indexing is still running.
+        searchIndex = []
         do {
-            searchIndex = try await engine.list(storageId: sid, path: "/", recursive: true)
+            for try await batch in await engine.listStream(
+                storageId: sid, path: "/", recursive: true)
+            {
+                searchIndex.append(contentsOf: batch)
+            }
             indexedStorageID = sid
         } catch {
+            // A mid-walk failure (e.g. an unreadable subdirectory) leaves a
+            // partial index; discard it so search doesn't present incomplete
+            // results as complete. indexedStorageID stays unset → we re-index.
+            searchIndex = []
             lastError = "Search indexing failed: \(error)"
         }
     }

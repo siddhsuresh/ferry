@@ -246,6 +246,68 @@ pub unsafe extern "C" fn Walk(input: *mut c_char, on_done: OnCbResult) {
     });
 }
 
+/// Streaming walk (Ferry extension): identical inputs to `Walk`, but entries are
+/// delivered to `on_batch` in chunks as they are read, so a large directory
+/// paints progressively instead of blocking on one final payload. `on_batch`
+/// receives a JSON array of the same entry shape `Walk` returns; `on_done` fires
+/// once at the end (`data: true` on success, or an error envelope). MTP is
+/// serial, so this doesn't read any faster — it just surfaces results as they
+/// arrive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn WalkStream(
+    input: *mut c_char,
+    on_batch: OnCbResult,
+    on_done: OnCbResult,
+) {
+    guard(on_done, || {
+        if let Err(e) = state::lock_mtp() {
+            emit_error(on_done, &e);
+            return;
+        }
+        let raw = unsafe { read_input(input) };
+        let parsed: json::WalkInput = match json::decode_input(&raw) {
+            Ok(v) => v,
+            Err(e) => return unmarshal_error(on_done, "WalkStream", &e),
+        };
+
+        // Deliver ~32 entries per callback: small enough that the first tiles
+        // appear almost immediately, large enough to keep callback overhead low.
+        const BATCH: usize = 32;
+        let mut batch: Vec<keel_vfs::FileInfo> = Vec::with_capacity(BATCH);
+        let emit = |b: &[keel_vfs::FileInfo]| {
+            if !b.is_empty() {
+                send(on_batch, &json::walk_json(b));
+            }
+        };
+
+        let result = {
+            let mut on_entry = |fi: &keel_vfs::FileInfo| {
+                batch.push(fi.clone());
+                if batch.len() >= BATCH {
+                    emit(&batch);
+                    batch.clear();
+                }
+            };
+            state::walk_streaming(
+                parsed.storage_id,
+                &parsed.full_path,
+                parsed.recursive,
+                parsed.skip_disallowed_files,
+                parsed.skip_hidden_files,
+                &mut on_entry,
+            )
+        };
+        emit(&batch); // flush the trailing partial batch
+
+        // Fires `on_done` exactly once. Nothing fallible may run after this
+        // match: a panic past here would re-fire `on_done` via `guard`.
+        match result {
+            Ok(()) => send(on_done, &json::walk_done_json()),
+            Err(e) => emit_error(on_done, &e),
+        }
+    });
+}
+
 /// Upload files to the device.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn UploadFiles(

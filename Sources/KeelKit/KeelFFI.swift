@@ -29,6 +29,9 @@ private typealias FnJSONCB = @convention(c) (
 private typealias FnJSON3CB = @convention(c) (
     UnsafeMutablePointer<CChar>?, KeelCCallback?, KeelCCallback?, KeelCCallback?
 ) -> Void
+private typealias FnJSON2CB = @convention(c) (
+    UnsafeMutablePointer<CChar>?, KeelCCallback?, KeelCCallback?
+) -> Void
 private typealias FnVoid = @convention(c) () -> Void
 
 // MARK: - Callback slots
@@ -165,6 +168,7 @@ public final class KeelLibrary: Sendable {
         /// them still loads (the core 11 + Dispose are required).
         let cancelTransfer: FnVoid?
         let fetchThumbnail: FnJSONCB?
+        let walkStream: FnJSON2CB?
     }
 
     private let symbols: Symbols
@@ -175,6 +179,9 @@ public final class KeelLibrary: Sendable {
 
     /// True when the loaded kernel can fetch device thumbnails.
     public var supportsThumbnails: Bool { symbols.fetchThumbnail != nil }
+
+    /// True when the loaded kernel can stream a walk in batches.
+    public var supportsWalkStream: Bool { symbols.walkStream != nil }
 
     public init(directory: URL) throws {
         let path = directory.appendingPathComponent(Self.dylibName).path
@@ -208,7 +215,9 @@ public final class KeelLibrary: Sendable {
             cancelTransfer: dlsym(handle, "CancelTransfer")
                 .map { unsafeBitCast($0, to: FnVoid.self) },
             fetchThumbnail: dlsym(handle, "FetchThumbnail")
-                .map { unsafeBitCast($0, to: FnJSONCB.self) }
+                .map { unsafeBitCast($0, to: FnJSONCB.self) },
+            walkStream: dlsym(handle, "WalkStream")
+                .map { unsafeBitCast($0, to: FnJSON2CB.self) }
         )
     }
 
@@ -287,6 +296,17 @@ public final class KeelLibrary: Sendable {
         guard let fn = symbols.fetchThumbnail else { return false }
         json.withCString { cstr in
             fn(UnsafeMutablePointer(mutating: cstr), doneTrampoline)
+        }
+        return true
+    }
+
+    /// Calls the optional WalkStream export. The batch callback rides the
+    /// progress slot (each fires a JSON array of entries); the done callback the
+    /// done slot. Returns false when the kernel lacks the export.
+    func rawWalkStream(json: String) -> Bool {
+        guard let fn = symbols.walkStream else { return false }
+        json.withCString { cstr in
+            fn(UnsafeMutablePointer(mutating: cstr), progressTrampoline, doneTrampoline)
         }
         return true
     }

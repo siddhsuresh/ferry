@@ -656,6 +656,13 @@ pub fn file_exists_json(exists: &[bool], input_files: &[String]) -> String {
     to_json(&Envelope::ok(null_if_empty(data)))
 }
 
+/// Terminal payload for the streaming `WalkStream`: the entries were already
+/// delivered through the batch callback, so the done callback just signals a
+/// clean finish. `data: true`.
+pub fn walk_done_json() -> String {
+    to_json(&Envelope::ok(true))
+}
+
 /// DeleteFile result: `data: true`.
 pub fn delete_file_json() -> String {
     to_json(&Envelope::ok(true))

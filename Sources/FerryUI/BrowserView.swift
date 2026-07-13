@@ -469,7 +469,17 @@ struct BrowserView: View {
                         .foregroundStyle(.secondary)
                 }
             } else if !session.searchQuery.isEmpty && session.searchResults.isEmpty {
-                ContentUnavailableView.search(text: session.searchQuery)
+                if session.isIndexing {
+                    // Still indexing — don't claim "No Results" prematurely.
+                    VStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Still indexing… no matches yet")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    ContentUnavailableView.search(text: session.searchQuery)
+                }
             }
         }
     }

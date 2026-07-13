@@ -1,37 +1,26 @@
 //! keel-conformance — the differential oracle.
 //!
-//! dlopens two frozen-ABI dylibs (--go <legacy> --rust <keel>),
-//! runs the IDENTICAL scripted "golden" session against the attached phone
-//! *sequentially* (Go first, `Dispose` to release the USB device, then Rust —
-//! the two kernels cannot share the device), captures every callback payload
-//! per side, normalizes the volatile fields, then does a structural,
-//! exact-key-casing, JSON-pointer diff. Exit code 0 only on full parity
-//! (documented intentional divergences — plan §3.5 — do not count against it).
+//! `dlopen`s two frozen-ABI dylibs (`--go` and `--rust`), runs the IDENTICAL
+//! scripted "golden" session against the attached phone *sequentially* (the go
+//! side first, `Dispose` to release the USB device, then the rust side — the two
+//! kernels cannot share the device), captures every callback payload per side,
+//! normalizes the volatile fields, then does a structural, exact-key-casing,
+//! JSON-pointer diff. Exit code 0 only on full parity (documented intentional
+//! divergences do not count against it).
 //!
-//! Dependency-light on purpose: `libc` (dlopen/dlsym/free) + `serde_json` only,
-//! per the plan's crate-7 note. No `libloading`, no clap, no async runtime.
+//! Dependency-light on purpose: `libc` (dlopen/dlsym/free) + `serde_json` only.
+//! No `libloading`, no clap, no async runtime.
 //!
 //! ── The callback ABI (the load-bearing quirk) ────────────────────────────────
-//! The legacy kernel header declares each callback slot as `on_cb_result_t*`
-//! (pointer-to-function-pointer), but the C shim in
-//! `kernel/send_to_js/main.go:6-14` does:
+//! The ABI header declares each callback slot as `on_cb_result_t*`
+//! (pointer-to-function-pointer), but the C shim casts that pointer value
+//! straight to a function pointer and calls it — the pointer *bits* are the fn,
+//! never dereferenced. So from the caller's side each export takes a plain
+//! `extern "C" fn(*mut c_char)` value in those slots.
 //!
-//! ```c
-//! void send_cb_result(on_cb_result_t* ptr, char* json) {
-//!     on_cb_result_t cb = (on_cb_result_t) ptr;   // the POINTER BITS *are* the fn
-//!     if (cb != 0 && cb != NULL) { cb(json); }
-//! }
-//! ```
-//!
-//! i.e. the value handed to the export in the `on_cb_result_t*` slot *is* the
-//! function pointer itself, called directly — never dereferenced. So from the
-//! caller's side each export takes a plain `extern "C" fn(*mut c_char)` value in
-//! those slots. keel-ffi mirrors this exactly (plan keel-ffi/abi).
-//!
-//! Payloads are `malloc`'d NUL-terminated UTF-8 C strings (Go's `C.CString`,
-//! Rust's libc-malloc'd `CString`); the *caller* owns them — we copy, then
-//! `libc::free`. Same system allocator on both sides, so `free` is correct for
-//! both.
+//! Payloads are `malloc`'d NUL-terminated UTF-8 C strings; the *caller* owns
+//! them — we copy, then `libc::free`. Both dylibs use the same system allocator,
+//! so `free` is correct for both.
 
 use libc::{c_char, c_void};
 use serde_json::Value;
@@ -46,27 +35,24 @@ use std::sync::Mutex;
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Fields that legitimately vary between two independent runs against the same
-// device and MUST be normalized away before diffing. The task enumerates
-// elapsedTime / speed / dateAdded / any *_time; the golden README generalizes
-// ("timestamps and rates vary per run"). We additionally normalize `objectId`
-// and `parentId`: MTP object *handles* are assigned by the device per session,
-// so any object freshly created inside the session (the uploaded tree, step
-// "walk after upload") gets a different handle in the Go session than in the
-// Rust session. Without this, every post-write walk entry would falsely diverge
-// on its handle. This is exactly a "volatile field that varies per run"; it is
-// documented here as a deliberate, justified addition beyond the task's
-// illustrative list.
+// device and MUST be normalized away before diffing: elapsedTime, speed,
+// dateAdded, and any *_time. We additionally normalize `objectId` and
+// `parentId`: MTP object *handles* are assigned by the device per session, so
+// any object freshly created inside the session (the uploaded tree, step "walk
+// after upload") gets a different handle on the go side than on the rust side.
+// Without this, every post-write walk entry would falsely diverge on its
+// handle — the same category as a per-run volatile field.
 //
 // Not normalized (deliberately): name / path / parentPath / extension / size /
 // isFolder / Sid / the error envelope strings — those are the parity signal.
 const VOLATILE_EXACT_KEYS: &[&str] = &[
-    "elapsedTime", // transfer wall-clock, ms — send_to_js/main.go SendTransferFilesProgress
+    "elapsedTime", // transfer wall-clock, ms
     "speed",       // instantaneous MB/s
-    "dateAdded",   // FileInfo.ModTime formatted; fresh uploads get a new mtime each run
+    "dateAdded",   // modification time; fresh uploads get a new mtime each run
     "objectId",    // device-assigned MTP handle — differs per session
     "parentId",    // device-assigned MTP handle — differs per session
-    // Live-device storage counters: the oracle runs the whole Go session, then
-    // the whole Rust session; Android writes to /data constantly, so these drift
+    // Live-device storage counters: the oracle runs the whole go session, then
+    // the whole rust session; Android writes to /data constantly, so these drift
     // between the two runs (measured: ~296 KB across one session; ~13 MB over a
     // few minutes). Not a decode difference — two back-to-back reads are byte-
     // identical. Same category as speed/timestamps.
@@ -80,10 +66,9 @@ fn is_volatile_key(k: &str) -> bool {
     VOLATILE_EXACT_KEYS.contains(&k) || k.to_ascii_lowercase().ends_with("time")
 }
 
-/// Relative tolerance for non-integer numeric comparison. jsoniter (Go) formats
-/// floats to ~6 significant digits; serde_json (Rust) renders them differently.
-/// The plan (§3.4) declares float formatting a *behavioral*-compat-only tier, so
-/// we compare non-integers with tolerance and only integers exactly. This
+/// Relative tolerance for non-integer numeric comparison. The two kernels' JSON
+/// encoders render floats differently (~6 significant digits vs full precision),
+/// so we compare non-integers with tolerance and only integers exactly. This
 /// absorbs the formatting deviation without hiding a real ~0.1% computation bug.
 const FLOAT_REL_EPS: f64 = 1e-4;
 const FLOAT_ABS_EPS: f64 = 1e-6;
@@ -187,13 +172,14 @@ impl Lib {
     fn open(label: &'static str, path: &str) -> Result<Lib, String> {
         let cpath = CString::new(path).map_err(|e| e.to_string())?;
         // SAFETY: standard dlopen. RTLD_LOCAL keeps the two kernels' symbols in
-        // separate namespaces so `Initialize` from Go can't collide with Rust's.
+        // separate namespaces so `Initialize` from the go dylib can't collide
+        // with the rust one's.
         let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
             return Err(format!("dlopen({path}) failed: {}", dlerror_text()));
         }
         // SAFETY: each symbol is transmuted from its dlsym'd address to the
-        // matching legacy kernel export ABI. Sizes are checked at compile time
+        // matching export ABI. Sizes are checked at compile time
         // (pointer == fn-pointer on the supported targets).
         unsafe {
             Ok(Lib {
@@ -217,8 +203,8 @@ impl Lib {
 
 impl Drop for Lib {
     fn drop(&mut self) {
-        // Best-effort. A Go c-shared runtime does not truly support unload, but
-        // the device was already released by Dispose, so this is only tidiness.
+        // Best-effort: the loaded runtime may not truly support unload, but the
+        // device was already released by Dispose, so this is only tidiness.
         if !self.handle.is_null() {
             unsafe { libc::dlclose(self.handle) };
         }
@@ -229,8 +215,8 @@ impl Drop for Lib {
 // The golden session script
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Reconstructed from keel/fixtures/golden/*.json (captured from the Go kernel vs
-// a Nothing A059). Fixtures are numbered per *payload*; this script is per
+// The scripted session that both dylibs run. Fixtures under
+// keel/fixtures/golden/*.json are numbered per *payload*; this script is per
 // *step* — the UploadFiles step alone emits payloads 0009-0014. Placeholders
 // {SID} / {SRC} / {DL} are filled at run time: {SID} from the live FetchStorages
 // result (so the oracle works on any device, not just Sid 65537), {SRC}/{DL}
@@ -256,10 +242,10 @@ struct Step {
     /// Golden payload numbers this step reproduces (for cross-reference).
     fixtures: &'static str,
     op: Op,
-    /// A step where Go and Rust are *expected* to differ because keel fixes an
-    /// internal Go bug (plan §3.5). A divergence here is reported but does NOT
-    /// fail the run; agreement is warned about (it would mean the fix regressed
-    /// or the oracle over-normalized).
+    /// A step where the two sides are *expected* to differ because the rust side
+    /// fixes a bug present in the go side. A divergence here is reported but does
+    /// NOT fail the run; agreement is warned about (it would mean the fix
+    /// regressed or the oracle over-normalized).
     expect_divergence: bool,
 }
 
@@ -306,10 +292,9 @@ fn golden_script() -> Vec<Step> {
         },
         Step {
             // The 🛳️ (U+1F6F3 + U+FE0F) filename round-trips through the device.
-            // Go's UCS-2 string codec drops the surrogate pair, walking it back
-            // as "note-️.txt"; keel-proto's real UTF-16 codec keeps it. This is
-            // the port fix (golden README "Intentional divergences", plan §3.5),
-            // so Go vs Rust WILL differ on this entry's name/path — expected.
+            // The go side's UCS-2 codec drops the surrogate pair, walking it back
+            // as "note-️.txt"; the rust side's real UTF-16 codec keeps it. So the
+            // two sides WILL differ on this entry's name/path — expected.
             name: "Walk /Download/keel-golden-test (recursive, emoji)",
             fixtures: "0015",
             op: Op::Walk(r#"{"storageId":{SID},"fullPath":"/Download/keel-golden-test","recursive":true,"skipDisallowedFiles":true,"skipHiddenFiles":false}"#),
@@ -446,8 +431,7 @@ fn run_session(lib: &Lib, script: &[Step], env: &Env) -> Vec<StepCapture> {
 }
 
 fn call_json1(f: FnJson1, input: &str) {
-    // NUL-terminated; the export copies it (Go's C.GoString) so it only needs to
-    // outlive the call.
+    // NUL-terminated; the export copies it, so it only needs to outlive the call.
     let Ok(c) = CString::new(input) else { return };
     unsafe { f(c.as_ptr(), Some(cb_done)) }
 }
@@ -457,7 +441,7 @@ fn call_json3(f: FnJson3, input: &str) {
     unsafe { f(c.as_ptr(), Some(cb_preprocess), Some(cb_progress), Some(cb_done)) }
 }
 
-/// Pull `data[0].Sid` out of a FetchStorages capture (raw Go PascalCase key).
+/// Pull `data[0].Sid` out of a FetchStorages capture (raw PascalCase key).
 fn extract_sid(events: &[Event]) -> Option<u32> {
     let v = events.first()?.value.as_ref()?;
     let arr = v.get("data")?.as_array()?;
@@ -517,7 +501,7 @@ fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
     if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
         return x == y;
     }
-    // At least one is a float: compare with tolerance (plan §3.4 float tier).
+    // At least one is a float: compare with tolerance.
     let (x, y) = match (a.as_f64(), b.as_f64()) {
         (Some(x), Some(y)) => (x, y),
         _ => return false,
@@ -635,9 +619,9 @@ fn diff_exact_stream(label: &str, go: &[&Value], rust: &[&Value], out: &mut Vec<
 }
 
 /// A sampler-driven stream (Upload/Download preprocess & progress). The 500 ms
-/// latest-value sampler (plan keel-ffi/sampler) makes both the *count* and
-/// *which* snapshots land timing-dependent — even the terminal one — so we do
-/// NOT diff values. We assert: presence parity (both emitted, or neither), the
+/// latest-value sampler makes both the *count* and *which* snapshots land
+/// timing-dependent — even the terminal one — so we do NOT diff values. We
+/// assert: presence parity (both emitted, or neither), the
 /// terminal payload's key *schema* matches, and a handful of run-invariant
 /// `stable_fields` (e.g. totalFiles) agree. Everything else is reported as an
 /// informational note. Content correctness of a transfer is verified separately
@@ -716,7 +700,7 @@ fn partition(events: &[Event], kind: CbKind) -> Vec<&Value> {
         .collect()
 }
 
-/// Compare one step's Go capture to its Rust capture.
+/// Compare one step's go capture to its rust capture.
 fn diff_step(go: &StepCapture, rust: &StepCapture) -> (Vec<FieldDiff>, Vec<String>) {
     let mut diffs = Vec::new();
     let mut infos = Vec::new();
@@ -765,13 +749,14 @@ fn diff_step(go: &StepCapture, rust: &StepCapture) -> (Vec<FieldDiff>, Vec<Strin
 
 /// The emoji filename the golden session uploads: "note-" + U+1F6F3 (PASSENGER
 /// SHIP, an astral-plane char → UTF-16 surrogate pair) + U+FE0F (variation
-/// selector) + ".txt". This is the input that exposes Go's UCS-2 codec bug on
-/// the round-trip walk.
+/// selector) + ".txt". This is the input that exposes the go side's UCS-2 codec
+/// bug on the round-trip walk.
 const EMOJI_NOTE_NAME: &str = "note-\u{1F6F3}\u{FE0F}.txt";
 
 /// Build `<root>/keel-golden-src/{blob-1.5mb.bin, note-🛳️.txt, sub/nested.bin}`
-/// with exact byte sizes (1_500_000 / 51 / 300_000) matching the golden capture,
-/// plus an empty `<root>/keel-golden-dl` download target. Returns (src, dl).
+/// with the fixed byte sizes the golden fixtures expect (1_500_000 / 51 /
+/// 300_000), plus an empty `<root>/keel-golden-dl` download target. Returns
+/// (src, dl).
 fn setup_scratch(root: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let src = root.join("keel-golden-src");
     let sub = src.join("sub");
@@ -915,7 +900,8 @@ fn main() {
     println!("  src  : {}", env.src_dir);
     println!("  steps: {}\n", script.len());
 
-    // Go first (fully, ending in Dispose which releases the device), then Rust.
+    // The go side first (fully, ending in Dispose which releases the device),
+    // then rust.
     println!("running Go session…");
     let go_caps = run_session(&go_lib, &script, &env);
     println!("running Rust session…\n");
@@ -1027,7 +1013,7 @@ mod tests {
 
     #[test]
     fn float_formatting_tolerated_but_real_gap_caught() {
-        // jsoniter vs serde_json rendering of the same float32 → tolerated.
+        // The two kernels' encoders render the same float32 differently → tolerated.
         assert!(diff(json!({"p": 83.330971}), json!({"p": 83.33097})).is_empty());
         // A ~1% real difference is still caught.
         assert_eq!(diff(json!({"p": 83.3}), json!({"p": 84.5})).len(), 1);
@@ -1087,7 +1073,7 @@ mod tests {
 
     #[test]
     fn sampled_stream_ignores_count_and_volatile_but_checks_totals() {
-        // Two progress snapshots on Go, one on Rust; totals agree → no divergence.
+        // Two progress snapshots on the go side, one on rust; totals agree → no divergence.
         let g1 = json!({"totalFiles": 3, "totalDirectories": 2, "bulkFileSize": {"total": 1800051}, "filesSent": 1});
         let g2 = json!({"totalFiles": 3, "totalDirectories": 2, "bulkFileSize": {"total": 1800051}, "filesSent": 2});
         let r1 = json!({"totalFiles": 3, "totalDirectories": 2, "bulkFileSize": {"total": 1800051}, "filesSent": 3});
@@ -1111,7 +1097,7 @@ mod tests {
     fn sampled_stream_presence_parity() {
         let g = json!({"x": 1});
         let (mut out, mut infos) = (Vec::new(), Vec::new());
-        // Go emitted a preprocess event, Rust emitted none → divergence.
+        // The go side emitted a preprocess event, rust emitted none → divergence.
         diff_sampled_stream("preprocess", &[&g], &[], &[], &mut out, &mut infos);
         assert_eq!(out.len(), 1);
     }

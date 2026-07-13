@@ -1,28 +1,24 @@
 //! PTP/MTP protocol constants — u16/u32 newtypes with spec-name `Display`.
 //!
-//! GENERATED, do not hand-edit. Regenerate from the Go reference with the
-//! porting-scratchpad codegen. Faithful port of:
-//!   * go-mtpfs `mtp/const.go` (munge.py output over libmtp `ptp.h`)
-//!   * go-mtpfs `mtp/android.go` `init()` (OC 0x95C1..0x95C5 name additions)
+//! GENERATED, do not hand-edit. Every `PREFIX_Suffix` value from the PTP/MTP
+//! spec becomes a SCREAMING_SNAKE associated const on its group newtype (the
+//! `PTP_` and group prefix stripped, camelCase folded to SCREAMING_SNAKE).
+//! `name()` / [`code_name`] reproduce the spec's vendor/duplicate-filtered
+//! debug-name subset, so lookups stay byte-for-byte stable. Operation codes
+//! 0x95C1..0x95C5 add the Android edit-object extension names.
 //!
-//! Every `PREFIX_Suffix` const becomes a SCREAMING_SNAKE associated const on
-//! its group newtype; naming mirrors munge.py (strip `PTP_` + group prefix,
-//! then camelCase -> SCREAMING_SNAKE). `name()` / [`code_name`] reproduce each
-//! Go `PREFIX_names` map *exactly* — the vendor/duplicate-filtered debug subset
-//! munge.py emits — so lookups match the Go stack byte-for-byte.
-//!
-//! Two documented ident deviations (values unchanged; leading digit / snake
-//! collision are unrepresentable as distinct Rust idents):
-//!   * `AT_2DPanoramic` (0x0006) -> [`AssociationType::PANORAMIC_2D`] (const.go:20).
-//!   * `DPC_NIKON_ISO_Auto` (0xD16A) -> [`DevicePropCode::NIKON_ISO_AUTO_ALT`];
+//! Two ident deviations (values unchanged; a leading digit and a snake-case
+//! collision can't be distinct Rust idents):
+//!   * spec `AT_2DPanoramic` (0x0006) -> [`AssociationType::PANORAMIC_2D`].
+//!   * spec `DPC_NIKON_ISO_Auto` (0xD16A) -> [`DevicePropCode::NIKON_ISO_AUTO_ALT`];
 //!     its SCREAMING_SNAKE form collides with `DPC_NIKON_ISOAuto` (0xD054),
-//!     a distinct libmtp `#define` at a different address (const.go:317/499).
+//!     a distinct spec constant at a different code.
 
 #![allow(clippy::unreadable_literal)]
 
 use core::fmt;
 
-/// operation code (`OC_*` in go-mtpfs const.go).
+/// Operation code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct OpCode(pub u16);
 
@@ -282,8 +278,8 @@ impl OpCode {
     pub const ANDROID_BEGIN_EDIT_OBJECT: Self = Self(0x95C4);
     pub const ANDROID_END_EDIT_OBJECT: Self = Self(0x95C5);
 
-    /// Debug name from go-mtpfs `OC_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x1000 => "Undefined",
@@ -392,7 +388,7 @@ impl fmt::Display for OpCode {
     }
 }
 
-/// return code (`RC_*` in go-mtpfs const.go).
+/// Return code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct RespCode(pub u16);
 
@@ -471,8 +467,8 @@ impl RespCode {
     pub const MTP_OBJECT_TOO_LARGE: Self = Self(0xA809);
     pub const MTP_OBJECT_PROP_NOT_SUPPORTED: Self = Self(0xA80A);
 
-    /// Debug name from go-mtpfs `RC_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x2000 => "Undefined",
@@ -539,7 +535,7 @@ impl fmt::Display for RespCode {
     }
 }
 
-/// event code (`EC_*` in go-mtpfs const.go).
+/// Event code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct EventCode(pub u16);
 
@@ -596,8 +592,8 @@ impl EventCode {
     pub const CANON_EOS_RECORDING_TIME: Self = Self(0xC195);
     pub const CANON_EOS_AF_RESULT: Self = Self(0xC1A3);
 
-    /// Debug name from go-mtpfs `EC_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x4000 => "Undefined",
@@ -636,7 +632,7 @@ impl fmt::Display for EventCode {
     }
 }
 
-/// object format code (`OFC_*` in go-mtpfs const.go).
+/// Object format code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ObjectFormat(pub u16);
 
@@ -734,8 +730,8 @@ impl ObjectFormat {
     pub const MTP_MEDIA_CAST: Self = Self(0xBE81);
     pub const MTP_SECTION: Self = Self(0xBE82);
 
-    /// Debug name from go-mtpfs `OFC_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x3000 => "Undefined",
@@ -839,7 +835,7 @@ impl fmt::Display for ObjectFormat {
     }
 }
 
-/// device property code (`DPC_*` in go-mtpfs const.go).
+/// Device property code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct DevicePropCode(pub u16);
 
@@ -1433,8 +1429,8 @@ impl DevicePropCode {
     pub const MTP_PLAYBACK_POSITION: Self = Self(0xD413);
     pub const EXTENSION_MASK: Self = Self(0xF000);
 
-    /// Debug name from go-mtpfs `DPC_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x5000 => "Undefined",
@@ -1542,7 +1538,7 @@ impl fmt::Display for DevicePropCode {
     }
 }
 
-/// object property code (`OPC_*` in go-mtpfs const.go).
+/// Object property code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ObjectPropCode(pub u16);
 
@@ -1716,8 +1712,8 @@ impl ObjectPropCode {
     pub const ENCODING_QUALITY: Self = Self(0xDEA0);
     pub const ENCODING_PROFILE: Self = Self(0xDEA1);
 
-    /// Debug name from go-mtpfs `OPC_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0xB104 => "WirelessConfigurationFile",
@@ -1902,7 +1898,7 @@ impl fmt::Display for ObjectPropCode {
     }
 }
 
-/// data type code (`DTC_*` in go-mtpfs const.go).
+/// Data type code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct DataType(pub u16);
 
@@ -1921,8 +1917,8 @@ impl DataType {
     pub const ARRAY_MASK: Self = Self(0x4000);
     pub const STR: Self = Self(0xFFFF);
 
-    /// Debug name from go-mtpfs `DTC_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "UNDEF",
@@ -1952,7 +1948,7 @@ impl fmt::Display for DataType {
     }
 }
 
-/// storage type (`ST_*` in go-mtpfs const.go).
+/// Storage type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct StorageType(pub u16);
 
@@ -1963,8 +1959,8 @@ impl StorageType {
     pub const FIXED_RAM: Self = Self(0x0003);
     pub const REMOVABLE_RAM: Self = Self(0x0004);
 
-    /// Debug name from go-mtpfs `ST_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "Undefined",
@@ -1986,7 +1982,7 @@ impl fmt::Display for StorageType {
     }
 }
 
-/// filesystem type (`FST_*` in go-mtpfs const.go).
+/// Filesystem type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct FilesystemType(pub u16);
 
@@ -1996,8 +1992,8 @@ impl FilesystemType {
     pub const GENERIC_HIERARCHICAL: Self = Self(0x0002);
     pub const DCF: Self = Self(0x0003);
 
-    /// Debug name from go-mtpfs `FST_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "Undefined",
@@ -2018,7 +2014,7 @@ impl fmt::Display for FilesystemType {
     }
 }
 
-/// storage access capability (`AC_*` in go-mtpfs const.go).
+/// Storage access capability.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct AccessCapability(pub u16);
 
@@ -2027,8 +2023,8 @@ impl AccessCapability {
     pub const READ_ONLY: Self = Self(0x0001);
     pub const READ_ONLY_WITH_OBJECT_DELETION: Self = Self(0x0002);
 
-    /// Debug name from go-mtpfs `AC_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "ReadWrite",
@@ -2048,7 +2044,7 @@ impl fmt::Display for AccessCapability {
     }
 }
 
-/// association type (`AT_*` in go-mtpfs const.go).
+/// Association type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct AssociationType(pub u16);
 
@@ -2062,8 +2058,8 @@ impl AssociationType {
     pub const PANORAMIC_2D: Self = Self(0x0006);
     pub const ANCILLARY_DATA: Self = Self(0x0007);
 
-    /// Debug name from go-mtpfs `AT_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "Undefined",
@@ -2088,7 +2084,7 @@ impl fmt::Display for AssociationType {
     }
 }
 
-/// byte-order directionality (`DL_*` in go-mtpfs const.go).
+/// Byte-order directionality.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Directionality(pub u16);
 
@@ -2096,8 +2092,8 @@ impl Directionality {
     pub const LE: Self = Self(0x000F);
     pub const BE: Self = Self(0x00F0);
 
-    /// Debug name from go-mtpfs `DL_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x000F => "LE",
@@ -2116,7 +2112,7 @@ impl fmt::Display for Directionality {
     }
 }
 
-/// device property form field (`DPFF_*` in go-mtpfs const.go).
+/// Device property form field.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct DevicePropFormFlag(pub u16);
 
@@ -2125,8 +2121,8 @@ impl DevicePropFormFlag {
     pub const RANGE: Self = Self(0x0001);
     pub const ENUMERATION: Self = Self(0x0002);
 
-    /// Debug name from go-mtpfs `DPFF_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "None",
@@ -2146,7 +2142,7 @@ impl fmt::Display for DevicePropFormFlag {
     }
 }
 
-/// device property get/set (`DPGS_*` in go-mtpfs const.go).
+/// Device property get/set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct DevicePropGetSet(pub u16);
 
@@ -2154,8 +2150,8 @@ impl DevicePropGetSet {
     pub const GET: Self = Self(0x0000);
     pub const GET_SET: Self = Self(0x0001);
 
-    /// Debug name from go-mtpfs `DPGS_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "Get",
@@ -2174,7 +2170,7 @@ impl fmt::Display for DevicePropGetSet {
     }
 }
 
-/// PTP-layer error code (`ERROR_*` in go-mtpfs const.go).
+/// PTP-layer error code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct PtpErrorCode(pub u16);
 
@@ -2186,8 +2182,8 @@ impl PtpErrorCode {
     pub const DATA_EXPECTED: Self = Self(0x02FE);
     pub const IO: Self = Self(0x02FF);
 
-    /// Debug name from go-mtpfs `ERROR_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x02FA => "TIMEOUT",
@@ -2210,15 +2206,15 @@ impl fmt::Display for PtpErrorCode {
     }
 }
 
-/// Nikon vendor constant (`NIKON_*` in go-mtpfs const.go).
+/// Nikon vendor constant.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct NikonConst(pub u16);
 
 impl NikonConst {
     pub const MAX_CURVE_POINTS: Self = Self(0x0013);
 
-    /// Debug name from go-mtpfs `NIKON_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0013 => "MaxCurvePoints",
@@ -2236,7 +2232,7 @@ impl fmt::Display for NikonConst {
     }
 }
 
-/// object property form field (`OPFF_*` in go-mtpfs const.go).
+/// Object property form field.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ObjectPropFormFlag(pub u16);
 
@@ -2250,8 +2246,8 @@ impl ObjectPropFormFlag {
     pub const BYTE_ARRAY: Self = Self(0x0006);
     pub const LONG_STRING: Self = Self(0x00FF);
 
-    /// Debug name from go-mtpfs `OPFF_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "None",
@@ -2276,7 +2272,7 @@ impl fmt::Display for ObjectPropFormFlag {
     }
 }
 
-/// protection status (`PS_*` in go-mtpfs const.go).
+/// Protection status.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ProtectionStatus(pub u16);
 
@@ -2286,8 +2282,8 @@ impl ProtectionStatus {
     pub const MTP_READ_ONLY_DATA: Self = Self(0x8002);
     pub const MTP_NON_TRANSFERABLE_DATA: Self = Self(0x8003);
 
-    /// Debug name from go-mtpfs `PS_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "NoProtection",
@@ -2308,7 +2304,7 @@ impl fmt::Display for ProtectionStatus {
     }
 }
 
-/// USB container / bulk constant (`USB_*` in go-mtpfs const.go).
+/// USB container / bulk constant.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct UsbContainer(pub u16);
 
@@ -2321,8 +2317,8 @@ impl UsbContainer {
     pub const BULK_HS_MAX_PACKET_LEN_READ: Self = Self(0x0200);
     pub const BULK_HS_MAX_PACKET_LEN_WRITE: Self = Self(0x0200);
 
-    /// Debug name from go-mtpfs `USB_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x0000 => "CONTAINER_UNDEFINED",
@@ -2345,7 +2341,7 @@ impl fmt::Display for UsbContainer {
     }
 }
 
-/// get object handles selector (`GOH_*` in go-mtpfs const.go).
+/// Get object handles selector.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct GetObjectHandles(pub u32);
 
@@ -2355,8 +2351,8 @@ impl GetObjectHandles {
     pub const ALL_STORAGE: Self = Self(0xFFFFFFFF);
     pub const ROOT_PARENT: Self = Self(0xFFFFFFFF);
 
-    /// Debug name from go-mtpfs `GOH_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x00000000 => "ALL_ASSOCS",
@@ -2375,7 +2371,7 @@ impl fmt::Display for GetObjectHandles {
     }
 }
 
-/// object handler selector (`HANDLER_*` in go-mtpfs const.go).
+/// Object handler selector.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Handler(pub u32);
 
@@ -2383,8 +2379,8 @@ impl Handler {
     pub const ROOT: Self = Self(0x00000000);
     pub const SPECIAL: Self = Self(0xFFFFFFFF);
 
-    /// Debug name from go-mtpfs `HANDLER_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x00000000 => "ROOT",
@@ -2403,7 +2399,7 @@ impl fmt::Display for Handler {
     }
 }
 
-/// MTP/PTP vendor extension id (`VENDOR_*` in go-mtpfs const.go).
+/// MTP/PTP vendor extension id.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Vendor(pub u32);
 
@@ -2423,8 +2419,8 @@ impl Vendor {
     pub const PENTAX: Self = Self(0x0000000D);
     pub const FUJI: Self = Self(0x0000000E);
 
-    /// Debug name from go-mtpfs `VENDOR_names` (const.go). `None` for
-    /// values munge.py filtered out (vendor extensions / duplicate values).
+    /// Debug name for this code, or `None` for vendor extensions and
+    /// duplicate values omitted from the name table.
     pub fn name(self) -> Option<&'static str> {
         Some(match self.0 {
             0x00000001 => "EASTMAN_KODAK",
@@ -2479,10 +2475,10 @@ pub enum CodeKind {
     Usb,
 }
 
-/// Debug lookup mirroring go-mtpfs `PREFIX_names[code]` for the `u16` groups.
+/// Debug lookup of a `u16` code's spec name within its constant group.
 ///
 /// Returns the spec name for `code` within `kind`, or `None` when the value is
-/// absent from that group's Go name map (vendor extension / duplicate value).
+/// absent from that group's name table (vendor extension / duplicate value).
 /// The `u32` selector groups (GOH/HANDLER/VENDOR) resolve via their own
 /// `name()` methods, not here (their sentinels don't fit `u16`).
 pub fn code_name(kind: CodeKind, code: u16) -> Option<&'static str> {
@@ -2514,7 +2510,7 @@ mod tests {
     use super::*;
 
     // 25 known values spanning every constant group. Values are load-bearing
-    // spec facts (go-mtpfs const.go); a mismatch here is a wire-protocol bug.
+    // spec facts; a mismatch here is a wire-protocol bug.
     #[test]
     fn spot_check_values() {
         // operation codes
@@ -2523,7 +2519,7 @@ mod tests {
         assert_eq!(OpCode::SEND_OBJECT, OpCode(0x100D));
         assert_eq!(OpCode::GET_STORAGE_IDS, OpCode(0x1004));
         assert_eq!(OpCode::MTP_GET_OBJECT_PROP_VALUE, OpCode(0x9803));
-        // android opcodes (android.go)
+        // android opcodes
         assert_eq!(OpCode::ANDROID_GET_PARTIAL_OBJECT64, OpCode(0x95C1));
         assert_eq!(OpCode::ANDROID_SEND_PARTIAL_OBJECT, OpCode(0x95C2));
         assert_eq!(OpCode::ANDROID_TRUNCATE_OBJECT, OpCode(0x95C3));
@@ -2560,7 +2556,7 @@ mod tests {
         );
     }
 
-    // The two documented ident deviations still carry the exact Go values.
+    // The two documented ident deviations still carry the exact spec values.
     #[test]
     fn documented_deviations_preserve_values() {
         assert_eq!(AssociationType::PANORAMIC_2D, AssociationType(0x0006));
@@ -2584,12 +2580,12 @@ mod tests {
             Some("ObjectFileName")
         );
         assert_eq!(code_name(CodeKind::DataType, 0x000A), Some("UINT128"));
-        // android additions land in OC_names via android.go init()
+        // android additions land in the operation-code name table
         assert_eq!(
             code_name(CodeKind::Op, 0x95C1),
             Some("ANDROID_GET_PARTIAL_OBJECT64")
         );
-        // vendor extensions were filtered out of the Go name maps -> None.
+        // vendor extensions are filtered out of the name tables -> None.
         assert_eq!(code_name(CodeKind::Op, 0x9001), None); // CANON_GetPartialObjectInfo
         assert_eq!(code_name(CodeKind::Op, 0xFFFF), None);
     }

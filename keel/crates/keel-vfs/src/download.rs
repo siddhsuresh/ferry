@@ -1,45 +1,37 @@
-//! `download_files` — device → local disk, a faithful port of go-mtpx
-//! `DownloadFiles` (main.go:556-700) plus its helpers `processDownloadFiles`
-//! (helpers.go:464-535), `processDownloadFilesError` (helpers.go:537-560),
-//! `handleMakeLocalFile` (helpers.go:277-306), `makeLocalDirectory`
-//! (helpers.go:387-404) and `restoreLocalFileTimestamp` (helpers.go:563-572).
+//! `download_files` — device → local disk: enumerate objects under the sources,
+//! recreate the tree on disk, and stream each object into a local file.
 //!
-//! Operates on a generic `&mut MtpSession<T>` like the rest of keel-vfs (the
-//! keel analogue of go-mtpx's `dev *mtp.Device`); the FFI reaches it via
-//! `Device::session_mut()`.
+//! Operates on a generic `&mut MtpSession<T>` like the rest of keel-vfs; the FFI
+//! reaches it via `Device::session_mut()`.
 //!
-//! Behaviours preserved:
+//! Load-bearing behaviours:
 //!   * each object is fetched whole via GetObject and streamed straight to
-//!     `File::create` — a **silent** local overwrite (helpers.go:278);
+//!     `File::create` — a **silent** local overwrite;
 //!   * the device modification time is restored onto the local file after the
-//!     write (helpers.go:305);
-//!   * local parent directories are created on demand (helpers.go:484-491);
-//!   * `.DS_Store` / the test sentinel are filtered;
-//!   * the **final `sent = total` fix-up tick** (helpers.go:298-303): GetObject's
-//!     progress under-reports by the first data packet's bytes (the same quirk Go
-//!     had — see keel-mtp's `bulk_read`), so when the last reported `sent` is short
-//!     of the file size, one extra progress tick with `sent == total` is emitted.
-//!     Load-bearing for the `ActiveFileSize.Sent == .Total` download assertions.
+//!     write;
+//!   * local parent directories are created on demand;
+//!   * `.DS_Store` and the test sentinel are filtered out;
+//!   * the **final `sent = total` fix-up tick**: GetObject's progress under-reports
+//!     by the first data packet's bytes (see keel-mtp's `bulk_read`), so when the
+//!     last reported `sent` is short of the file size, one extra progress tick with
+//!     `sent == total` is emitted. Required so the wire contract's
+//!     `active_file_size.sent == .total` invariant holds at completion.
 //!
-//! Fidelity FIX (plan §3.5 "nondeterministic download order"): with pre-processing
-//! on, Go accumulated files into a `map[string]…` and then `range`d it — Go map
-//! iteration order is randomised, so the transfer order (and thus the
-//! progress-event sequence) was nondeterministic. keel uses a [`BTreeMap`] keyed by
-//! destination path: same last-write-wins de-duplication Go's map gave, but a
-//! stable, sorted iteration order.
+//! Deterministic order: with pre-processing on, walked objects are collected into
+//! a [`BTreeMap`] keyed by destination path — last-write-wins de-duplication with
+//! a stable, sorted iteration order, so the transfer (and progress-event) sequence
+//! is reproducible.
 //!
-//! Structural deviation (forced by Rust's borrow checker): in Go's no-preprocess
-//! path the transfer runs *inside* the `Walk` callback, i.e. it uses the device
-//! while `Walk` is still enumerating with it. keel cannot hold `&mut MtpSession` in
-//! both `walk` and its callback, so it collects the walked `FileInfo`s first
-//! (callback touches only a `Vec`), then transfers them. The device-DFS transfer
-//! order is preserved, so the file sequence and every progress value are identical;
-//! only enumeration/transfer interleaving (unobservable) differs.
+//! Collect-then-transfer (forced by the borrow checker): we cannot hold
+//! `&mut MtpSession` in both `walk` and its callback, so the no-preprocess path
+//! collects the walked `FileInfo`s first (the callback touches only a `Vec`), then
+//! transfers them. The device-DFS transfer order is preserved, so the file
+//! sequence and every progress value are unchanged; only the (unobservable)
+//! enumeration/transfer interleaving differs.
 //!
-//! Cancel seam (keel addition, see upload.rs): `should_cancel` is polled once per
-//! preprocessed file and once per progress tick; a fire aborts with the distinct
-//! `VfsError::Cancelled` (Go bubbled `TransferCancelledError` through
-//! `FileTransferError` and relied on the FFI substring match — equivalent).
+//! Cancellation (see upload.rs): `should_cancel` is polled once per preprocessed
+//! file and once per progress tick; a fire aborts with the distinct
+//! `VfsError::Cancelled`.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -54,15 +46,13 @@ use crate::path::{fix_slash, get_full_path, get_object_from_path};
 use crate::progress::{ProgressInfo, TransferStatus, percent, transfer_rate};
 use crate::walk::{is_disallowed_files, walk};
 
-/// Download preprocess callback: go-mtpx `MtpPreprocessCb`
-/// (`func(fi *FileInfo, err error) error`, structs.go:91), nil-error slot dropped.
+/// Download preprocess callback, invoked once per file during the counting pass.
 pub type MtpPreprocessCb<'a> = &'a mut dyn FnMut(&FileInfo) -> Result<(), VfsError>;
 
-/// Progress callback (same shape as upload): go-mtpx `ProgressCb`.
+/// Progress callback (same shape as upload), invoked on every per-chunk tick.
 pub type ProgressCb<'a> = &'a mut dyn FnMut(&ProgressInfo) -> Result<(), VfsError>;
 
-/// go-mtpx `processDownloadFilesProps` (structs.go:98-101) — the mutable transfer
-/// bookkeeping threaded through `processDownloadFiles`.
+/// Mutable transfer bookkeeping threaded through `process_download_files`.
 struct DownloadProps {
     destination_file_parent_path: String,
     destination_file_path: String,
@@ -73,7 +63,7 @@ struct DownloadProps {
     total_size: i64,
 }
 
-/// go-mtpx `downloadFilesObjectCacheContainer` (structs.go:105-108).
+/// A single walked object staged for transfer, keyed by destination path.
 struct DownloadCacheEntry {
     file_info: FileInfo,
     source_parent_path: String,
@@ -81,10 +71,10 @@ struct DownloadCacheEntry {
     destination_file_path: String,
 }
 
-/// Splits the two error origins Go's `processDownloadFilesError` switch cares
-/// about: a raw local-fs error ([`Self::Io`], Go's `*os.PathError` from
-/// `os.Create`/`os.Chtimes`) versus everything else ([`Self::Vfs`] — already a
-/// typed mtpx error, an mtp error, or `Cancelled`).
+/// Splits the two error origins the terminal classifier cares about: a raw
+/// local-fs error ([`Self::Io`], from `File::create`/set-times) versus everything
+/// else ([`Self::Vfs`] — an already-typed vfs error, an mtp error, or
+/// `Cancelled`).
 enum DlError {
     Vfs(VfsError),
     Io(std::io::Error),
@@ -93,13 +83,11 @@ enum DlError {
 /// A per-chunk progress sink (see upload.rs): `FnMut(total, sent, object_id)`.
 type SizeProgressCb<'a> = &'a mut dyn FnMut(i64, i64, u32) -> Result<(), VfsError>;
 
-/// Transfer files from the device to the local disk — port of go-mtpx
-/// `DownloadFiles` (main.go:556-700).
+/// Transfer files from the device to the local disk.
 ///
 /// Returns `(bulk_files_sent, bulk_size_sent)`. As with `upload_files`, the
-/// partial counts Go returned alongside an error are dropped (keel-ffi discards
-/// them on error anyway).
-#[allow(clippy::too_many_arguments)] // 1:1 with the Go signature (main.go:556).
+/// partial counts are dropped on error (keel-ffi discards them on error anyway).
+#[allow(clippy::too_many_arguments)]
 pub fn download_files<T: Transport>(
     session: &mut MtpSession<T>,
     storage_id: u32,
@@ -121,11 +109,11 @@ pub fn download_files<T: Transport>(
     let bulk_files_sent: i64 = 0;
     let bulk_size_sent: i64 = 0;
 
-    // The preprocess object cache (main.go:589). Fidelity fix: a BTreeMap for a
-    // deterministic, sorted iteration order (Go's `map` was randomised).
+    // The preprocess object cache. A BTreeMap gives a deterministic, sorted
+    // iteration order.
     let mut cache: BTreeMap<String, DownloadCacheEntry> = BTreeMap::new();
 
-    // --- optional preprocess pass (main.go:590-637) ---
+    // --- optional preprocess pass ---
     if preprocess_files {
         for source in sources {
             let _source = fix_slash(source);
@@ -146,7 +134,7 @@ pub fn download_files<T: Transport>(
                             &_destination,
                         );
 
-                    // main.go:605 — cache EVERY walked object (dirs included).
+                    // Cache EVERY walked object (dirs included).
                     cache.insert(
                         destination_file_path.clone(),
                         DownloadCacheEntry {
@@ -163,8 +151,7 @@ pub fn download_files<T: Transport>(
                     if is_disallowed_files(&fi.name) {
                         return Ok(());
                     }
-                    // Cancel per preprocessed file (legacy kernel L454, polled inside the
-                    // download preprocess callback — reached only for real files).
+                    // Cancel per preprocessed file (reached only for real files).
                     if should_cancel() {
                         return Err(VfsError::Cancelled);
                     }
@@ -174,7 +161,7 @@ pub fn download_files<T: Transport>(
                 },
             );
 
-            // main.go:630-632 — a Walk failure returns raw.
+            // A walk failure returns raw.
             let (_oid, tf, td) = walk_res?;
             total_files += tf;
             total_directories += td;
@@ -196,8 +183,8 @@ pub fn download_files<T: Transport>(
     };
 
     if !cache.is_empty() {
-        // --- preprocessed path (main.go:650-661): transfer from the cache in the
-        // BTreeMap's deterministic key order.
+        // --- preprocessed path: transfer from the cache in the BTreeMap's
+        // deterministic key order.
         for entry in cache.values() {
             dfprops.source_parent_path = entry.source_parent_path.clone();
             dfprops.destination_file_parent_path = entry.destination_file_parent_path.clone();
@@ -215,13 +202,12 @@ pub fn download_files<T: Transport>(
             }
         }
     } else {
-        // --- no-preprocess path (main.go:662-692). See the module note: collect,
-        // then transfer, to avoid holding `&mut MtpSession` in both `walk` and its
-        // callback.
+        // --- no-preprocess path. See the module note: collect, then transfer, to
+        // avoid holding `&mut MtpSession` in both `walk` and its callback.
         for source in sources {
             let _source = fix_slash(source);
 
-            // main.go:666-669 — validate the source path; a failure returns raw.
+            // Validate the source path; a failure returns raw.
             get_object_from_path(session, storage_id, &_source)?;
 
             let source_parent_path = go_filepath_dir(&_source);
@@ -268,7 +254,7 @@ pub fn download_files<T: Transport>(
         }
     }
 
-    // --- final Completed tick (main.go:694-697) ---
+    // --- final Completed tick ---
     pinfo.status = TransferStatus::Completed;
     if should_cancel() {
         return Err(VfsError::Cancelled);
@@ -278,8 +264,8 @@ pub fn download_files<T: Transport>(
     Ok((dfprops.bulk_files_sent, dfprops.bulk_size_sent))
 }
 
-/// Port of go-mtpx `processDownloadFiles` (helpers.go:464-535) — download a single
-/// walked object (dir → local mkdir; file → GetObject + progress).
+/// Download a single walked object (dir → local mkdir; file → GetObject +
+/// progress).
 fn process_download_files<T: Transport>(
     session: &mut MtpSession<T>,
     pinfo: &mut ProgressInfo,
@@ -288,20 +274,18 @@ fn process_download_files<T: Transport>(
     dfprops: &mut DownloadProps,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<(), DlError> {
-    // helpers.go:466-468.
     if is_disallowed_files(&fi.name) {
         return Ok(());
     }
 
-    // helpers.go:471-480 — a directory becomes a local directory, carrying its
-    // device modification time.
+    // A directory becomes a local directory, carrying its device modification time.
     if fi.is_dir {
         make_local_directory(&dfprops.destination_file_path, fi.mod_time)?;
         return Ok(());
     }
 
-    // helpers.go:483-491 — create the local parent on demand (with "now" as its
-    // mtime, since we lack the parent's real one here).
+    // Create the local parent on demand (with "now" as its mtime, since we lack
+    // the parent's real one here).
     if !file_exists_local(&dfprops.destination_file_parent_path) {
         make_local_directory(
             &dfprops.destination_file_parent_path,
@@ -309,10 +293,10 @@ fn process_download_files<T: Transport>(
         )?;
     }
 
-    // helpers.go:494 — counted BEFORE the transfer.
+    // Counted BEFORE the transfer.
     dfprops.bulk_files_sent += 1;
-    pinfo.latest_sent_time = SystemTime::now(); // helpers.go:496
-    pinfo.file_info = fi.clone(); // helpers.go:497
+    pinfo.latest_sent_time = SystemTime::now();
+    pinfo.file_info = fi.clone();
 
     // Pulled out so the progress closure can borrow `dfprops` (for bulk_size_sent)
     // without aliasing the `destination_file_path` handed to handle_make_local_file.
@@ -321,7 +305,7 @@ fn process_download_files<T: Transport>(
 
     let transfer_result = {
         let mut prev_sent_size: i64 = 0;
-        // The SizeProgressCb closure (helpers.go:502-525).
+        // The per-chunk progress closure.
         let mut size_progress = |total: i64, sent: i64, _obj_id: u32| -> Result<(), VfsError> {
             pinfo.active_file_size.total = total;
             pinfo.active_file_size.sent = sent;
@@ -352,16 +336,16 @@ fn process_download_files<T: Transport>(
     };
     transfer_result?;
 
-    // helpers.go:531-532.
+    // Update the post-transfer bookkeeping.
     pinfo.files_sent = dfprops.bulk_files_sent;
     pinfo.files_sent_progress = percent(dfprops.bulk_files_sent as f32, dfprops.total_files as f32);
 
     Ok(())
 }
 
-/// Port of go-mtpx `handleMakeLocalFile` (helpers.go:277-306): create (silently
-/// overwrite) the local file, stream the object into it, emit the sent=total
-/// fix-up tick if progress fell short, then restore the device mtime.
+/// Create (silently overwrite) the local file, stream the object into it, emit
+/// the sent=total fix-up tick if progress fell short, then restore the device
+/// mtime.
 fn handle_make_local_file<T: Transport>(
     session: &mut MtpSession<T>,
     fi: &FileInfo,
@@ -369,7 +353,7 @@ fn handle_make_local_file<T: Transport>(
     should_cancel: &dyn Fn() -> bool,
     size_progress_cb: SizeProgressCb<'_>,
 ) -> Result<(), DlError> {
-    // helpers.go:278-282 — os.Create: create or truncate (silent overwrite).
+    // Create or truncate the local file (silent overwrite).
     let mut f = File::create(destination).map_err(DlError::Io)?;
 
     // GetObject streams the object to `f`; progress reports cumulative bytes.
@@ -386,7 +370,7 @@ fn handle_make_local_file<T: Transport>(
             }
             match size_progress_cb(fi.size, sent as i64, fi.object_id) {
                 Ok(()) => {
-                    total_sent = sent as i64; // helpers.go:290
+                    total_sent = sent as i64;
                     Ok(())
                 }
                 Err(e) => {
@@ -404,14 +388,13 @@ fn handle_make_local_file<T: Transport>(
     if let Some(e) = inner_err {
         return Err(DlError::Vfs(e));
     }
-    // helpers.go:294-296 — a GetObject failure returns raw (an mtp error; the
-    // caller's switch lands it in the FileTransferError default arm).
+    // A GetObject failure returns raw (an mtp error; the caller lands it in the
+    // FileTransfer default arm).
     res.map_err(|e| DlError::Vfs(VfsError::Mtp(e)))?;
 
-    // helpers.go:298-303 — the sent=total fix-up tick. GetObject's progress omits
-    // the first data packet's bytes (keel-mtp bulk_read, matching Go), so a
-    // successful transfer usually ends with total_sent < fi.size; emit one final
-    // tick at 100 %.
+    // The sent=total fix-up tick. GetObject's progress omits the first data
+    // packet's bytes (see keel-mtp bulk_read), so a successful transfer usually
+    // ends with total_sent < fi.size; emit one final tick at 100 %.
     if total_sent < fi.size {
         if should_cancel() {
             return Err(DlError::Vfs(VfsError::Cancelled));
@@ -419,19 +402,17 @@ fn handle_make_local_file<T: Transport>(
         size_progress_cb(fi.size, fi.size, fi.object_id).map_err(DlError::Vfs)?;
     }
 
-    // helpers.go:305 — restore the device modification time onto the local file.
+    // Restore the device modification time onto the local file.
     restore_local_file_timestamp(destination, fi.mod_time)
 }
 
-/// Port of go-mtpx `makeLocalDirectory` (helpers.go:387-404): `os.MkdirAll` then
-/// restore the mtime. MkdirAll failures are classified permission ⇒
-/// `FilePermission`, else `LocalFile` (Go's `*os.PathError` arm); the mtime
-/// restore surfaces its raw error for the top-level switch (Go returned it raw).
+/// Create the directory (and parents), then restore the mtime. Create failures
+/// are classified permission ⇒ `FilePermission`, else `LocalFile`; the mtime
+/// restore surfaces its raw error for the top-level classifier.
 fn make_local_directory(filename: &str, mod_time: Option<SystemTime>) -> Result<(), DlError> {
     if let Err(e) = std::fs::create_dir_all(filename) {
-        // helpers.go:390-400. (All std fs errors are io::Error ≈ *os.PathError; Go's
-        // `default` non-PathError arm is unreachable here, so every error is
-        // classified into the two mtpx variants.)
+        // Every create-dir failure is an io::Error, classified into one of the two
+        // vfs variants.
         return Err(DlError::Vfs(
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 VfsError::FilePermission(e.to_string())
@@ -443,19 +424,15 @@ fn make_local_directory(filename: &str, mod_time: Option<SystemTime>) -> Result<
     restore_local_file_timestamp(filename, mod_time)
 }
 
-/// Port of go-mtpx `restoreLocalFileTimestamp` (helpers.go:563-572): set the access
-/// time to now and the modification time to `mod_time` (Go's `os.Chtimes(dest, now,
-/// modTime)`).
+/// Set the access time to now and the modification time to `mod_time`.
 ///
-/// `mod_time` is `Option` because `FileInfo.mod_time` is (`None` == Go's zero
-/// `time.Time`); a `None` degrades to the Unix epoch rather than Go's year-1 zero
-/// time — a harmless difference that only surfaces for objects the device reports
-/// with no modification date.
+/// `mod_time` is `Option` because `FileInfo.mod_time` is; a `None` degrades to the
+/// Unix epoch, which only surfaces for objects the device reports with no
+/// modification date.
 ///
-/// Go's `os.Chtimes` operates on the path; std has no path-based equivalent, so
-/// keel opens the target and uses [`File::set_times`]. This works on directories
-/// too (as `makeLocalDirectory` needs) on Unix — see the returned open-issues list.
-/// A failure surfaces as [`DlError::Io`], matching Go's raw `*os.PathError`.
+/// std has no path-based set-times, so we open the target and use
+/// [`File::set_times`]. This works on directories too (as `make_local_directory`
+/// needs) on Unix. A failure surfaces as [`DlError::Io`].
 fn restore_local_file_timestamp(path: &str, mod_time: Option<SystemTime>) -> Result<(), DlError> {
     let modified = mod_time.unwrap_or(SystemTime::UNIX_EPOCH);
     let times = FileTimes::new()
@@ -465,17 +442,15 @@ fn restore_local_file_timestamp(path: &str, mod_time: Option<SystemTime>) -> Res
     f.set_times(times).map_err(DlError::Io)
 }
 
-/// Port of go-mtpx `processDownloadFilesError` (helpers.go:537-560). Classifies the
-/// terminal error; the counts Go returned with it are dropped (discarded on error
-/// by keel-ffi). A `Cancelled` short-circuit sits in front (keel keeps the distinct
-/// variant instead of Go's FileTransferError-wrap-plus-substring-match).
+/// Classify the terminal download error; the partial counts are dropped
+/// (discarded on error by keel-ffi). A `Cancelled` short-circuit sits in front.
 fn process_download_files_error(e: DlError) -> VfsError {
     match e {
         DlError::Vfs(VfsError::Cancelled) => VfsError::Cancelled,
-        // helpers.go:540-541 — `case InvalidPathError`: passed through.
+        // An `InvalidPath` passes through.
         DlError::Vfs(v @ VfsError::InvalidPath(_)) => v,
-        // helpers.go:543-552 — `case *os.PathError`: permission ⇒ FilePermission,
-        // NotExist ⇒ InvalidPath, else LocalFile.
+        // A raw local-fs error: permission ⇒ FilePermission, NotExist ⇒
+        // InvalidPath, else LocalFile.
         DlError::Io(io) => {
             if io.kind() == std::io::ErrorKind::PermissionDenied {
                 VfsError::FilePermission(io.to_string())
@@ -485,15 +460,15 @@ fn process_download_files_error(e: DlError) -> VfsError {
                 VfsError::LocalFile(io.to_string())
             }
         }
-        // helpers.go:553-555 default arm.
+        // Default: everything else becomes a FileTransfer error.
         DlError::Vfs(v) => {
             VfsError::FileTransfer(format!("an error occured while downloading the files. {v}"))
         }
     }
 }
 
-/// go-mtpx `fileExistsLocal` (utils.go:136-140): `!os.IsNotExist(err)` — true when
-/// the path exists OR the stat failed for a reason other than "not found".
+/// True when the path exists OR the stat failed for a reason other than "not
+/// found".
 fn file_exists_local(filename: &str) -> bool {
     match std::fs::metadata(filename) {
         Ok(_) => true,
@@ -501,9 +476,8 @@ fn file_exists_local(filename: &str) -> bool {
     }
 }
 
-/// go-mtpx `mapSourcePathToDestinationPath` (utils.go:217-224). Duplicated from
-/// upload.rs (shared, unported by any sibling); the gate agent may hoist both
-/// copies into `path.rs`.
+/// Duplicated from `upload.rs` so each transfer module stands alone. Both copies
+/// may be hoisted into `path.rs`.
 fn map_source_path_to_destination_path(
     source_path: &str,
     source_parent_path: &str,
@@ -516,8 +490,7 @@ fn map_source_path_to_destination_path(
     (go_filepath_dir(&full_path), full_path)
 }
 
-/// Unix `filepath.Dir` for a `fixSlash`'d path — `sourceParentPath =
-/// filepath.Dir(_source)` (main.go:600/677). Duplicated from `upload.rs`
+/// The parent directory of a `fix_slash`'d path. Duplicated from `upload.rs`
 /// deliberately so each transfer module stands alone.
 fn go_filepath_dir(p: &str) -> String {
     match p.rfind('/') {

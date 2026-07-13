@@ -1,20 +1,18 @@
 //! PTP dataset codec primitives — little-endian integers, count-prefixed
 //! arrays, PTP strings, and PTP datetimes. Pure, no I/O.
 //!
-//! Ported from go-mtpfs `mtp/encoding.go`. Decoders read from and advance a
-//! `&mut &[u8]` cursor (the crate-wide convention, mirroring the contract's
-//! `decode_string(buf: &mut &[u8])` / `DeviceInfo::decode(buf: &mut &[u8])`).
-//! Encoders append to a `&mut Vec<u8>`.
+//! Decoders read from and advance a `&mut &[u8]` cursor (the crate-wide
+//! convention, e.g. `decode_string(buf: &mut &[u8])` /
+//! `DeviceInfo::decode(buf: &mut &[u8])`). Encoders append to a `&mut Vec<u8>`.
 //!
-//! Two deliberate fixes over Go (plan §3.5, "internal bugs are fixed"):
-//!   1. **Real UTF-16** strings with surrogate pairs. Go used UCS-2
-//!      (`uint16(r)` / one `utf8.EncodeRune` per code unit), which truncates
-//!      and corrupts every code point > U+FFFF — emoji, rare CJK. See
-//!      [`encode_string`] / [`decode_string`].
-//!   2. **No trust of device input.** Go's `decodeArray` (encoding.go:104-135)
-//!      ignored short reads and silently zero-filled; keel bounds every read
-//!      against the buffer and returns [`ProtoError::Truncated`] instead of
-//!      allocating on an attacker-controlled count.
+//! Two deliberate behaviors worth calling out:
+//!   1. **Real UTF-16** strings with surrogate pairs, so every code point above
+//!      U+FFFF — emoji, rare CJK — round-trips instead of being truncated by a
+//!      UCS-2 (one code unit per rune) encoding. See [`encode_string`] /
+//!      [`decode_string`].
+//!   2. **No trust of device input.** Every read is bounds-checked against the
+//!      buffer and returns [`ProtoError::Truncated`] rather than zero-filling a
+//!      short read or allocating on an attacker-controlled count.
 
 use crate::error::ProtoError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,8 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // Little-endian integer read/write helpers (u8..u128, i8..i128).
 // ---------------------------------------------------------------------------
 //
-// Go used reflection + `binary.Read/Write` (encoding.go decodeField:255,
-// encodeField:299); keel spells them out. Reads never panic: a short buffer
+// Each read/write is spelled out per type. Reads never panic: a short buffer
 // yields `Truncated`, never an index panic or `unwrap` on device input.
 
 macro_rules! le_int {
@@ -68,16 +65,13 @@ le_int!(read_i128, write_i128, i128);
 // Count-prefixed arrays (u32 count, then that many elements).
 // ---------------------------------------------------------------------------
 //
-// Go `decodeArray`/`encodeArray` (encoding.go:104-179). Only u16 and u32
-// element types are reachable in practice: `kindSize` (encoding.go:81-100)
-// panics for 8-byte kinds, so go-mtpfs never decodes u64 arrays, and every
-// array field in `types.go` is `[]uint16` or `Uint32Array`.
+// Only u16 and u32 element types are reachable in practice: every array field
+// in the datasets is a `[]u16` or a `Uint32Array`.
 
 /// Read a `u32`-count-prefixed array of little-endian `u16`s.
 ///
-/// Unlike Go's `decodeArray` (which ignored short reads and left the tail
-/// zeroed), a count that would run past the buffer is rejected before any
-/// allocation, so a hostile count can neither over-read nor OOM.
+/// A count that would run past the buffer is rejected before any allocation, so
+/// a hostile count can neither over-read nor OOM.
 pub fn read_u16_array(buf: &mut &[u8]) -> Result<Vec<u16>, ProtoError> {
     let count = read_u32(buf)? as usize;
     let need = match count.checked_mul(2) {
@@ -111,7 +105,7 @@ pub fn read_u32_array(buf: &mut &[u8]) -> Result<Vec<u32>, ProtoError> {
     Ok(v)
 }
 
-/// Write a `u32`-count-prefixed array of `u16`s (Go `encodeArray`).
+/// Write a `u32`-count-prefixed array of `u16`s.
 pub fn write_u16_array(v: &[u16], out: &mut Vec<u8>) {
     write_u32(v.len() as u32, out);
     for &x in v {
@@ -119,7 +113,7 @@ pub fn write_u16_array(v: &[u16], out: &mut Vec<u8>) {
     }
 }
 
-/// Write a `u32`-count-prefixed array of `u32`s (Go `encodeArray`).
+/// Write a `u32`-count-prefixed array of `u32`s.
 pub fn write_u32_array(v: &[u32], out: &mut Vec<u8>) {
     write_u32(v.len() as u32, out);
     for &x in v {
@@ -133,38 +127,34 @@ pub fn write_u32_array(v: &[u32], out: &mut Vec<u8>) {
 
 /// Max PTP string *content* code units, i.e. excluding the trailing NUL unit.
 ///
-/// Go errored at `codepoints > 254` where `codepoints` counts content units
-/// PLUS the NUL terminator (encoding.go:62-64), so the largest string that
-/// encodes is 253 content units. See [`encode_string`] for how keel handles
-/// overflow under an infallible signature.
+/// The 1-byte wire count spans content units PLUS the NUL terminator and must
+/// stay <= 254, so the largest string that encodes is 253 content units. See
+/// [`encode_string`] for how overflow is handled under an infallible signature.
 const MAX_STRING_CONTENT_UNITS: usize = 253;
 
 /// Encode a PTP string into `out`.
 ///
 /// Wire form: a 1-byte count = number of UTF-16 code units **including** the
 /// NUL terminator, followed by that many little-endian `u16`s. The empty string
-/// is a single `0x00` byte with **no** terminator unit (encoding.go:47-50).
+/// is a single `0x00` byte with **no** terminator unit.
 ///
-/// FIX (plan §3.5): Go wrote `uint16(r)` for each rune (encoding.go:57), a
-/// UCS-2 truncation that mangles any code point above U+FFFF. keel emits real
-/// UTF-16, so astral code points become surrogate pairs and round-trip intact.
+/// Astral code points are emitted as real UTF-16 surrogate pairs, so anything
+/// above U+FFFF round-trips intact rather than being truncated to UCS-2.
 ///
-/// DEVIATION: Go returned an error for strings whose count would exceed 254
-/// (encoding.go:63). The contract fixes this function's signature as infallible
-/// (`docs/CONTRACTS.md`), so instead keel caps the content at
+/// This signature is infallible, so an over-long string is capped at
 /// [`MAX_STRING_CONTENT_UNITS`] (253) — never splitting a surrogate pair — so
 /// the 1-byte count can never wrap or overflow. Ferry filenames never approach
 /// this; the cap only guards against a pathological name producing a malformed
 /// frame.
 pub fn encode_string(s: &str, out: &mut Vec<u8>) {
-    // encoding.go:47-50 — empty string is a lone count byte, no terminator.
+    // Empty string is a lone count byte, no terminator.
     if s.is_empty() {
         out.push(0);
         return;
     }
 
     let count_idx = out.len();
-    out.push(0); // placeholder count byte (encoding.go:53 `append(buf[:0], 0)`)
+    out.push(0); // placeholder count byte, backfilled once the length is known
 
     let mut units: usize = 0;
     for u in s.encode_utf16() {
@@ -185,31 +175,27 @@ pub fn encode_string(s: &str, out: &mut Vec<u8>) {
         }
     }
 
-    // NUL terminator unit (encoding.go:61 `append(buf, 0, 0)`).
+    // NUL terminator unit.
     out.extend_from_slice(&[0, 0]);
-    units += 1; // count includes the terminator (encoding.go:62)
+    units += 1; // count includes the terminator
 
     out[count_idx] = units as u8; // fits: units <= 254 by construction
 }
 
 /// Decode a PTP string from `buf`, advancing past it.
 ///
-/// FIX (plan §3.5): Go's `decodeStr` (encoding.go:15-44) ran each `u16` through
-/// `utf8.EncodeRune` independently — UCS-2 — turning both halves of a surrogate
-/// pair into U+FFFD. keel decodes real UTF-16; unpaired surrogates (genuinely
-/// malformed device data) become U+FFFD via [`char::decode_utf16`], so decoding
-/// is lossy-but-total and never panics.
+/// Decodes real UTF-16: surrogate pairs recombine into astral code points, and
+/// unpaired surrogates (genuinely malformed device data) become U+FFFD via
+/// [`char::decode_utf16`], so decoding is lossy-but-total and never panics.
 ///
 /// A count byte declaring more units than remain in `buf` is a truncated frame
-/// and returns [`ProtoError::Truncated`] (Go returned `"underflow"`,
-/// encoding.go:31-33).
+/// and returns [`ProtoError::Truncated`].
 pub fn decode_string(buf: &mut &[u8]) -> Result<String, ProtoError> {
-    // Count byte. On an empty buffer Go's `r.Read` failed and returned the
-    // error (encoding.go:17-19) — so do we (a genuinely empty *string* is a
-    // 0x00 byte we would read here, not an empty buffer).
+    // Count byte. An empty buffer is an error, not an empty string — a
+    // genuinely empty *string* is a 0x00 byte we would read here.
     let sz = read_u8(buf)? as usize;
     if sz == 0 {
-        // encoding.go:22-24 — count 0 is the empty string.
+        // Count 0 is the empty string.
         return Ok(String::new());
     }
 
@@ -224,9 +210,7 @@ pub fn decode_string(buf: &mut &[u8]) -> Result<String, ProtoError> {
         .map(|i| u16::from_le_bytes([data[2 * i], data[2 * i + 1]]))
         .collect();
 
-    // Strip the trailing NUL terminator unit. Go stripped a trailing 0x00
-    // *byte* after UTF-8 encoding (encoding.go:39-41); only U+0000 encodes to a
-    // 0x00 byte, so dropping a trailing 0x0000 code unit is equivalent.
+    // Strip the trailing NUL terminator unit if present.
     if units.last() == Some(&0) {
         units.pop();
     }
@@ -242,17 +226,14 @@ pub fn decode_string(buf: &mut &[u8]) -> Result<String, ProtoError> {
 
 /// Encode a PTP datetime as the string `"YYYYMMDDThhmmss"` into `out`.
 ///
-/// Go `encodeTime` (encoding.go:188-202) formatted with `timeFormat =
-/// "20060102T150405"` and encoded a zero/unset `time.Time` as the empty string.
+/// `SystemTime` is a timezone-naive instant and keel-proto carries no timezone
+/// facilities, so the instant is formatted as **UTC** civil time.
+/// `decode_datetime` parses UTC symmetrically, so wire round-trips are exact;
+/// callers that need device-local wall-clock must offset the instant before
+/// calling. (Recorded as an open issue for keel-vfs.)
 ///
-/// DEVIATION: Go formatted in the `time.Time`'s own location (local, for file
-/// mtimes). `SystemTime` is a timezone-naive instant and keel-proto carries no
-/// timezone facilities (`log`-only dep), so keel formats the instant as **UTC**
-/// civil time. `decode_datetime` parses UTC symmetrically, so wire round-trips
-/// are exact; callers that need device-local wall-clock must offset the instant
-/// before calling. (Recorded as an open issue for keel-vfs.)
-/// An instant before the Unix epoch encodes as the empty string, mirroring
-/// Go's zero-`time.Time` → empty-string behaviour.
+/// An instant before the Unix epoch encodes as the empty string, the same form
+/// used for an unset time.
 pub fn encode_datetime(t: SystemTime, out: &mut Vec<u8>) {
     let s = match t.duration_since(UNIX_EPOCH) {
         Ok(dur) => format_ptp_datetime(dur.as_secs()),
@@ -261,27 +242,25 @@ pub fn encode_datetime(t: SystemTime, out: &mut Vec<u8>) {
     encode_string(&s, out);
 }
 
-/// Parse a PTP datetime string into a [`SystemTime`], applying the exact
-/// vendor-tolerance ladder from Go `decodeTime` (encoding.go:204-228):
+/// Parse a PTP datetime string into a [`SystemTime`], applying the vendor
+/// tolerance ladder:
 ///
-/// 1. Samsung: strip trailing `'.'` (`strings.TrimRight(s, ".")`).
-/// 2. Jolla Sailfish: strip trailing `'Z'` (`strings.TrimRight(s, "Z")`).
-/// 3. Parse `"YYYYMMDDThhmmss"` as UTC (Go `time.Parse` with no location).
+/// 1. Samsung: strip a trailing `'.'`.
+/// 2. Jolla Sailfish: strip a trailing `'Z'`.
+/// 3. Parse `"YYYYMMDDThhmmss"` as UTC.
 /// 4. Fallback — Nokia Lumia: parse `"YYYYMMDDThhmmss±hhmm"` (numeric TZ).
 ///
-/// The empty string decodes to [`UNIX_EPOCH`] (Go left the zero `time.Time`).
-/// Anything that survives step 1/2 non-empty but parses in neither format is a
-/// [`ProtoError::BadDate`] — matching Go, which errored when a non-empty input
-/// trimmed away or failed both parses. Never panics.
+/// The empty string decodes to [`UNIX_EPOCH`]. Anything that survives steps 1/2
+/// non-empty but parses in neither format is a [`ProtoError::BadDate`]. Never
+/// panics.
 pub fn decode_datetime(s: &str) -> Result<SystemTime, ProtoError> {
-    // Go checked the ORIGINAL string: an empty input stays zero-time with no
-    // parse (encoding.go:210). A non-empty input that trims to "" still enters
-    // the parse block and errors — we reproduce that below.
+    // Check the ORIGINAL string: an empty input stays epoch with no parse. A
+    // non-empty input that trims to "" still enters the parse block and errors.
     if s.is_empty() {
         return Ok(UNIX_EPOCH);
     }
 
-    // TrimRight cutsets, in Go's order: dots first, then Z's.
+    // Trim cutsets, in order: dots first, then Z's.
     let trimmed = s.trim_end_matches('.').trim_end_matches('Z');
 
     if let Some(secs) = parse_ptp_datetime(trimmed) {
@@ -318,7 +297,7 @@ fn parse_ptp_datetime(s: &str) -> Option<i64> {
 }
 
 /// Parse `"YYYYMMDDThhmmss±hhmm"` (exactly 20 bytes) → Unix seconds (UTC),
-/// applying the numeric timezone offset (Go `timeFormatNumTZ`).
+/// applying the numeric timezone offset.
 fn parse_ptp_datetime_tz(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() != 20 {
@@ -354,9 +333,9 @@ fn parse_digits(b: &[u8]) -> Option<i64> {
     Some(v)
 }
 
-/// Validate coarse field ranges (like Go's `time.Parse` rejecting garbage) and
-/// convert a civil UTC datetime to Unix seconds. Returns `None` on an
-/// out-of-range field so the caller falls through to the TZ form / `BadDate`.
+/// Validate coarse field ranges (rejecting garbage) and convert a civil UTC
+/// datetime to Unix seconds. Returns `None` on an out-of-range field so the
+/// caller falls through to the TZ form / `BadDate`.
 fn civil_to_unix_secs(y: i64, mo: i64, d: i64, h: i64, mi: i64, se: i64) -> Option<i64> {
     if !(1..=12).contains(&mo)
         || !(1..=31).contains(&d)
@@ -478,8 +457,8 @@ mod tests {
 
     #[test]
     fn array_count_beyond_buffer_errors_not_allocates() {
-        // count says 1_000_000 u16 but only a few bytes follow: must error
-        // (Go would have zero-filled), never allocate on the hostile count.
+        // count says 1_000_000 u16 but only a few bytes follow: must error,
+        // never allocate on the hostile count.
         let mut out = Vec::new();
         write_u32(1_000_000, &mut out);
         out.extend_from_slice(&[0u8; 4]);
@@ -493,11 +472,11 @@ mod tests {
         }
     }
 
-    // --- strings: ported encoding_test.go cases ----------------------------
+    // --- strings -----------------------------------------------------------
 
     #[test]
     fn encode_str_empty() {
-        // TestEncodeStrEmpty: "" -> single 0x00 byte.
+        // "" -> single 0x00 byte.
         let mut out = Vec::new();
         encode_string("", &mut out);
         assert_eq!(out, vec![0x00]);
@@ -505,7 +484,7 @@ mod tests {
 
     #[test]
     fn encode_str_a_umlaut() {
-        // TestEncodeStr: "ä" -> \x02\xe4\x00\x00\x00
+        // "ä" -> \x02\xe4\x00\x00\x00
         let mut out = Vec::new();
         encode_string("ä", &mut out);
         assert_eq!(out, vec![0x02, 0xE4, 0x00, 0x00, 0x00]);
@@ -513,7 +492,7 @@ mod tests {
 
     #[test]
     fn decode_str_o_umlaut_roundtrip() {
-        // TestDecodeStr: encode "ö", decode back to "ö".
+        // encode "ö", decode back to "ö".
         let mut out = Vec::new();
         encode_string("ö", &mut out);
         let mut b = &out[..];
@@ -533,8 +512,8 @@ mod tests {
 
     #[test]
     fn emoji_surrogate_pair_roundtrip() {
-        // The whole point of the UCS-2 fix. "😀" = U+1F600 = surrogate pair
-        // [D83D, DE00]; count = 2 content + 1 terminator = 3.
+        // "😀" = U+1F600 = surrogate pair [D83D, DE00]; count = 2 content + 1
+        // terminator = 3.
         let mut out = Vec::new();
         encode_string("😀", &mut out);
         assert_eq!(
@@ -567,8 +546,8 @@ mod tests {
         let mut b = &out[..];
         assert_eq!(decode_string(&mut b).unwrap(), s);
 
-        // Overlong input is capped at 253 content units (documented deviation
-        // from Go's error), count byte stays 254, no panic, no wrap.
+        // Overlong input is capped at 253 content units, count byte stays 254,
+        // no panic, no wrap.
         let long: String = "a".repeat(300);
         let mut out2 = Vec::new();
         encode_string(&long, &mut out2);
@@ -626,8 +605,8 @@ mod tests {
 
     #[test]
     fn datetime_samsung_dot_roundtrip() {
-        // Ported TestDecodeTime: "20120101T010022." (Samsung trailing dot)
-        // decodes, re-encodes, and reads back as the canonical form.
+        // "20120101T010022." (Samsung trailing dot) decodes, re-encodes, and
+        // reads back as the canonical form.
         let t = decode_datetime("20120101T010022.").unwrap();
         let mut out = Vec::new();
         encode_datetime(t, &mut out);
@@ -665,7 +644,7 @@ mod tests {
     #[test]
     fn datetime_trims_to_empty_is_error_like_go() {
         // Non-empty input that trims away enters the parse block and fails
-        // both formats, so Go errored — and so do we.
+        // both formats, so it errors.
         assert!(matches!(decode_datetime("Z"), Err(ProtoError::BadDate(_))));
         assert!(matches!(decode_datetime("."), Err(ProtoError::BadDate(_))));
     }

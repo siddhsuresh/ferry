@@ -1,38 +1,35 @@
-//! Transfer progress model — a faithful port of go-mtpx `structs.go`
-//! (`TransferSizeInfo`, `ProgressInfo`), `enums.go` (`TransferStatus`) and the
-//! two progress arithmetic helpers from `utils.go` (`Percent`, `transferRate`).
+//! Transfer progress model: the `SizeInfo` / `ProgressInfo` / `TransferStatus`
+//! types plus the two progress arithmetic helpers (`percent`, `transfer_rate`).
 //!
 //! These types are what `upload_files` / `download_files` mutate in place and
 //! hand (by shared reference) to the caller's progress callback on every tick.
 //! keel-ffi's 500 ms sampler snapshots the latest one and serialises it, so the
 //! field set and the exact arithmetic (percent-of-zero == 0, speed rounded to
-//! 2 dp) are load-bearing for JSON parity.
+//! 2 dp) are load-bearing for the wire contract.
 //!
-//! Naming: Go's `TransferSizeInfo` is exported here as [`SizeInfo`] to match the
-//! crate's `lib.rs` re-export (`pub use progress::{ProgressInfo, SizeInfo,
-//! TransferStatus}`). Field names are the Go names, snake_cased.
+//! Naming: `SizeInfo` is exported under that name to match the crate's `lib.rs`
+//! re-export (`pub use progress::{ProgressInfo, SizeInfo, TransferStatus}`).
 
 use std::time::SystemTime;
 
 use crate::object::FileInfo;
 
-/// go-mtpx `TransferStatus` (enums.go:3-8). A Go `type TransferStatus string`
-/// with exactly two values; modelled as an enum here. [`Self::as_str`] gives the
-/// wire spelling keel-ffi serialises (`"InProgress"` / `"Completed"`), preserved
-/// verbatim.
+/// The transfer status carried in each progress tick. [`Self::as_str`] gives the
+/// wire spelling keel-ffi serialises (`"InProgress"` / `"Completed"`), which the
+/// wire contract fixes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferStatus {
     /// Emitted on every per-chunk tick while a file is transferring.
     InProgress,
-    /// Emitted once, as the final progress tick, after every file is done
-    /// (UploadFiles/DownloadFiles set `pInfo.Status = Completed` then call the
-    /// progress callback one last time — main.go:542-545 / 694-697).
+    /// Emitted once, as the final progress tick, after every file is done:
+    /// `upload_files`/`download_files` set `status = Completed` and call the
+    /// progress callback one last time.
     Completed,
 }
 
 impl TransferStatus {
-    /// The exact string Go's `TransferStatus` carried (enums.go:6-7). keel-ffi's
-    /// JSON must reproduce these spellings.
+    /// The exact wire spelling for each status; keel-ffi's JSON must reproduce
+    /// these.
     pub fn as_str(self) -> &'static str {
         match self {
             TransferStatus::InProgress => "InProgress",
@@ -41,36 +38,35 @@ impl TransferStatus {
     }
 }
 
-/// go-mtpx `TransferSizeInfo` (structs.go:36-46). Size accounting for either the
-/// currently-active file or the whole bulk session.
+/// Size accounting for either the currently-active file or the whole bulk
+/// session.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SizeInfo {
-    /// Total size to transfer. **0 when pre-processing was not requested**
-    /// (go-mtpx never fills it in that case — the `preprocessFiles == false`
-    /// path leaves `totalSize == 0`, so the bulk `Total` stays 0 and every
-    /// bulk percentage is `Percent(x, 0) == 0`).
+    /// Total size to transfer. **0 when pre-processing was not requested** — that
+    /// path never computes a total, so the bulk `total` stays 0 and every bulk
+    /// percentage is `percent(x, 0) == 0`.
     pub total: i64,
     /// Total size transferred so far.
     pub sent: i64,
-    /// Progress as a percentage in `[0, 100]` (`Percent(sent, total)`).
+    /// Progress as a percentage in `[0, 100]` (`percent(sent, total)`).
     pub progress: f32,
 }
 
-/// go-mtpx `ProgressInfo` (structs.go:48-81). One mutable instance lives for the
-/// whole `upload_files`/`download_files` call; it is mutated in place and passed
-/// by reference to the caller's progress callback each tick.
+/// One mutable instance lives for the whole `upload_files`/`download_files` call;
+/// it is mutated in place and passed by reference to the caller's progress
+/// callback each tick.
 #[derive(Clone, Debug)]
 pub struct ProgressInfo {
-    /// The file currently being transferred. Go held a `*FileInfo` initialised
-    /// to `&FileInfo{}`; here it is owned and default-constructed.
+    /// The file currently being transferred. Owned and default-constructed until
+    /// the first file starts.
     pub file_info: FileInfo,
 
-    /// Wall-clock time the transfer session started (`time.Now()`, structs.go:52).
+    /// Wall-clock time the transfer session started.
     pub start_time: SystemTime,
 
     /// Wall-clock time of the most recent tick. Reset to "now" *after* each
-    /// progress callback returns (main.go:497 / helpers.go:522), so it feeds the
-    /// next tick's [`transfer_rate`] as the interval start.
+    /// progress callback returns, so it feeds the next tick's [`transfer_rate`] as
+    /// the interval start.
     pub latest_sent_time: SystemTime,
 
     /// Instantaneous transfer rate for the last chunk (see [`transfer_rate`]).
@@ -82,13 +78,12 @@ pub struct ProgressInfo {
     /// Total directories to transfer. **0 when pre-processing was not requested.**
     pub total_directories: i64,
 
-    /// Files fully transferred so far. Updated *after* each file completes
-    /// (main.go:508 / helpers.go:531), so during a file's own ticks this still
-    /// reflects the count *before* it — the exact off-by-one the go-mtpx tests
-    /// pin (`So(fi.FilesSent, ShouldEqual, prevFilesSent)`).
+    /// Files fully transferred so far. Updated *after* each file completes, so
+    /// during a file's own ticks this still reflects the count *before* it — an
+    /// off-by-one the wire contract depends on.
     pub files_sent: i64,
 
-    /// `Percent(files_sent, total_files)`. `0` for the whole run when
+    /// `percent(files_sent, total_files)`. `0` for the whole run when
     /// pre-processing was off (`total_files == 0`).
     pub files_sent_progress: f32,
 
@@ -103,9 +98,9 @@ pub struct ProgressInfo {
 }
 
 impl ProgressInfo {
-    /// The initial `ProgressInfo` go-mtpx builds at the top of `UploadFiles` /
-    /// `DownloadFiles` (main.go:277-289 / main.go:560-572): zeroed counters,
-    /// `StartTime`/`LatestSentTime` = now, empty `FileInfo`, `Status = InProgress`.
+    /// The initial `ProgressInfo` built at the top of `upload_files` /
+    /// `download_files`: zeroed counters, `start_time`/`latest_sent_time` = now,
+    /// empty `FileInfo`, `status = InProgress`.
     pub fn new() -> Self {
         let now = SystemTime::now();
         ProgressInfo {
@@ -130,10 +125,9 @@ impl Default for ProgressInfo {
     }
 }
 
-/// go-mtpx `Percent` (utils.go:177-183). Percentage of `partial` over `total`,
-/// with the **`total <= 0 => 0`** guard preserved verbatim — that guard is why
-/// every bulk percentage is `0` when pre-processing is disabled (`total == 0`),
-/// which several go-mtpx transfer tests assert.
+/// Percentage of `partial` over `total`, with a **`total <= 0 => 0`** guard —
+/// that guard is why every bulk percentage is `0` when pre-processing is disabled
+/// (`total == 0`).
 pub fn percent(partial: f32, total: f32) -> f32 {
     if total <= 0.0 {
         return 0.0;
@@ -141,17 +135,13 @@ pub fn percent(partial: f32, total: f32) -> f32 {
     (partial / total) * 100.0
 }
 
-/// go-mtpx `transferRate` (utils.go:247-256). Instantaneous rate for one chunk:
-/// `bytes / elapsed_ns * 1000`, rounded to two decimals, `0` when no time has
-/// elapsed.
+/// Instantaneous rate for one chunk: `bytes / elapsed_ns * 1000`, rounded to two
+/// decimals, `0` when no time has elapsed.
 ///
-/// The arithmetic is reproduced exactly (magic `* 1000`, `Round(rate*100)/100`).
-/// Go used `time.Since(lastSentTime)` off a monotonic clock; keel measures the
-/// wall-clock interval via [`SystemTime::duration_since`], treating a backwards
-/// clock (Err) as "no time elapsed" — the same `elapsedTime <= 0 => 0` outcome
-/// Go produced. Speed is a plan §3.4 "behavioural-compatible only" field (the
-/// conformance harness normalises it), so the monotonic-vs-wall difference is
-/// not a parity break.
+/// The interval is measured on the wall clock via [`SystemTime::duration_since`],
+/// treating a backwards clock (Err) as "no time elapsed" (the `elapsed <= 0 => 0`
+/// outcome). Speed is a behavioural-compatible-only field — the conformance
+/// harness normalises it — so the wall-clock measurement is not a parity break.
 pub fn transfer_rate(size: i64, last_sent_time: SystemTime) -> f64 {
     let elapsed_ns: i128 = SystemTime::now()
         .duration_since(last_sent_time)
@@ -184,7 +174,7 @@ mod tests {
 
     #[test]
     fn transfer_rate_zero_when_no_time_elapsed() {
-        // A time in the future => duration_since Err => 0 (Go's elapsed <= 0).
+        // A time in the future => duration_since Err => 0 (elapsed <= 0).
         let future = SystemTime::now() + std::time::Duration::from_secs(3600);
         assert_eq!(transfer_rate(1_000_000, future), 0.0);
     }

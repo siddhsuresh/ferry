@@ -4,20 +4,18 @@
 //!
 //! Each `bulk_in` call returns exactly one scripted device→host transfer (one
 //! "packet"), and every `bulk_out` call is recorded verbatim (including the
-//! empty terminal-ZLP request keel-mtp emits, per the gate ZLP reconciliation in
-//! keel-usb `pipes.rs`). That one-transfer-per-call model gives each test full
-//! control over packet boundaries — which is what the SeparateHeader /
-//! XHCI-null / saturation quirks are actually about.
+//! empty terminal-ZLP request keel-mtp emits, matching keel-usb's `pipes.rs` ZLP
+//! handling). That one-transfer-per-call model gives each test full control over
+//! packet boundaries — which is what the SeparateHeader / XHCI-null / saturation
+//! quirks are actually about.
 //!
-//! Every scenario's expected bytes are cross-checked against go-mtpfs
-//! `mtp/mtp.go` `runTransaction`/`bulkWrite`/`bulkRead`/`Configure` logic
-//! (lines cited inline). Scenarios pinned here:
-//!   1. `separate_header_autodetect_then_mirrored_writes`   (mtp.go:456-469, 541-545)
-//!   2. `coalesced_header_device`                            (mtp.go:456-469, 543-545)
-//!   3. `xhci_response_in_place_of_null_packet`              (mtp.go:638-654, 480-491)
-//!   4. `session_already_opened_blind_close_then_retry`      (mtp.go:668-674)
-//!   5. `garbage_tid_syncerror_poisons_session`              (mtp.go:504-507, 387-393)
-//!   6. `four_gib_length_saturation_on_get_object`           (mtp.go:456, container 0xFFFFFFFF)
+//! Scenarios pinned here:
+//!   1. `separate_header_autodetect_then_mirrored_writes`
+//!   2. `coalesced_header_device`
+//!   3. `xhci_response_in_place_of_null_packet`
+//!   4. `session_already_opened_blind_close_then_retry`
+//!   5. `garbage_tid_syncerror_poisons_session`
+//!   6. `four_gib_length_saturation_on_get_object`
 
 use std::collections::VecDeque;
 use std::io::Cursor;
@@ -170,7 +168,6 @@ fn noprog() -> impl FnMut(u64, u32) -> Result<(), MtpError> {
 // ---------------------------------------------------------------------------
 // (1) SeparateHeader auto-detect on a 12-byte-first-packet device, then the
 //     write path mirrors it (header goes out in its own packet).
-//     go-mtpfs mtp.go:464-469 (detect) + 541-545 (mirror on write).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -204,7 +201,7 @@ fn separate_header_autodetect_then_mirrored_writes() {
     let w = shared.lock().unwrap();
     assert_eq!(w.writes.len(), 5, "openSession, getObject, sendObject cmd + header + data");
 
-    // The mirrored write: the DATA header is its OWN 12-byte packet (mtp.go:542).
+    // The mirrored write: the DATA header is its OWN 12-byte packet.
     let hdr = &w.writes[3];
     assert_eq!(hdr.len(), HDR_LEN as usize, "header shipped in a separate packet");
     let (kind, code, tid, len) = decode_write(hdr);
@@ -218,7 +215,7 @@ fn separate_header_autodetect_then_mirrored_writes() {
     // A short (4-byte) last transfer is not mps-aligned ⇒ no terminal ZLP.
     assert!(w.writes.iter().all(|x| !x.is_empty()), "no ZLP for this size");
 
-    // sid quirk (ops.go:27): rand | 1 — low bit set, never 0x00000000/0xFFFFFFFF.
+    // sid quirk: rand | 1 — low bit set, never 0x00000000/0xFFFFFFFF.
     let sid = write_params(&w.writes[0])[0];
     assert_eq!(sid & 1, 1);
     assert_ne!(sid, 0xFFFF_FFFF);
@@ -227,7 +224,7 @@ fn separate_header_autodetect_then_mirrored_writes() {
 // ---------------------------------------------------------------------------
 // (2) Coalesced-header device: first data packet carries header + data
 //     together ⇒ detection stays "not separate" ⇒ writes stay coalesced
-//     (header + first chunk in one packet). go-mtpfs mtp.go:456-464, 543-545.
+//     (header + first chunk in one packet).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -251,7 +248,7 @@ fn coalesced_header_device() {
     assert_eq!(n, 4);
     assert_eq!(sink, b"ABCD");
 
-    // Write: header + first data chunk are coalesced into ONE packet (mtp.go:544).
+    // Write: header + first data chunk are coalesced into ONE packet.
     let payload = [0xAA, 0xBB, 0xCC, 0xDD];
     session
         .send_object(&mut Cursor::new(payload.to_vec()), payload.len() as u64, &mut noprog())
@@ -270,17 +267,17 @@ fn coalesced_header_device() {
     );
     assert_eq!(write_payload(data_write), &payload);
 
-    // Go quirk (mtp.go:597-600): all data fit the first packet ⇒ lastTransfer
-    // stays 0 ⇒ 0 % mps == 0 ⇒ a terminal ZLP is still emitted. keel signals it
-    // as an empty bulk_out (the gate ZLP reconciliation).
+    // ZLP quirk: all data fit the first packet ⇒ lastTransfer stays 0 ⇒
+    // 0 % mps == 0 ⇒ a terminal ZLP is still emitted. keel signals it as an
+    // empty bulk_out.
     assert_eq!(w.writes.len(), 5);
     assert!(w.writes[4].is_empty(), "terminal ZLP after a packet-aligned data phase");
 }
 
 // ---------------------------------------------------------------------------
 // (3) XHCI: the "null packet" after a packet-aligned data phase is actually the
-//     CONTAINER_OK response. bulkRead returns it; runTransaction reuses it
-//     instead of fetching again. go-mtpfs mtp.go:638-654 + 480-491.
+//     CONTAINER_OK response. The read returns it; the transaction reuses it
+//     instead of fetching again.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -290,7 +287,7 @@ fn xhci_response_in_place_of_null_packet() {
         // First data packet: a full 512-byte packet (12 header + 500 data),
         // declaring more to come ⇒ keep reading.
         data_packet(1024, OpCode::GET_OBJECT.0, 1, &[0u8; 500]),
-        // A packet-aligned (512 B) data transfer ⇒ bulkRead expects a null read.
+        // A packet-aligned (512 B) data transfer ⇒ the read expects a null packet.
         vec![0u8; 512],
         // XHCI: instead of a ZLP, the device sends the RESPONSE right here.
         response(RespCode::OK.0, 1),
@@ -320,7 +317,7 @@ fn xhci_response_in_place_of_null_packet() {
 
 // ---------------------------------------------------------------------------
 // (4) RC_SessionAlreadyOpened → blind CloseSession → OpenSession succeeds.
-//     No USB reset on this ladder arm. go-mtpfs mtp.go:668-674 (Configure).
+//     No USB reset on this ladder arm.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -353,8 +350,8 @@ fn session_already_opened_blind_close_then_retry() {
     assert_eq!(write_params(&w.writes[0])[0] & 1, 1);
     assert_eq!(write_params(&w.writes[2])[0] & 1, 1);
 
-    // DeleteObject is the first real op: tid 1, params {handle, 0} (ops.go:179 —
-    // the explicit trailing 0 that some devices require).
+    // DeleteObject is the first real op: tid 1, params {handle, 0} — the explicit
+    // trailing 0 that some devices require.
     let (_k, code, tid, _len) = decode_write(&w.writes[3]);
     assert_eq!(code, OpCode::DELETE_OBJECT.0);
     assert_eq!(tid, 1);
@@ -364,7 +361,6 @@ fn session_already_opened_blind_close_then_retry() {
 // ---------------------------------------------------------------------------
 // (5) A response with a mismatched transaction ID ⇒ SyncError ⇒ the connection
 //     is poisoned (closed); every later op fails fast with `Closed`.
-//     go-mtpfs mtp.go:504-507 (mismatch) + 387-393 (fatal ⇒ Close).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -412,16 +408,16 @@ fn garbage_tid_syncerror_poisons_session() {
 // ---------------------------------------------------------------------------
 // (6) 4 GiB length saturation on GetObject streaming: the DATA container
 //     advertises the 0xFFFFFFFF >4 GiB sentinel, yet the engine streams to a
-//     short packet and reports the TRUE byte count (not ~4 GiB). mtp.go:456
-//     (n < Length keeps reading) — the length field is never trusted as a bound.
+//     short packet and reports the TRUE byte count (not ~4 GiB) — the length
+//     field (n < Length keeps reading) is never trusted as a bound.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn four_gib_length_saturation_on_get_object() {
     let ins = vec![
         response(RespCode::OK.0, 0), // OpenSession
-        // DATA header declares the saturated >4 GiB sentinel (Container encode's
-        // 0xFFFFFFFF, mtp.go:533-537), carrying a full first packet.
+        // DATA header declares the saturated >4 GiB sentinel (0xFFFFFFFF),
+        // carrying a full first packet.
         data_packet(0xFFFF_FFFF, OpCode::GET_OBJECT.0, 1, &[0u8; 500]),
         // 400 more bytes: a short (< 16 KiB) read ends the phase, NOT the length.
         vec![0u8; 400],

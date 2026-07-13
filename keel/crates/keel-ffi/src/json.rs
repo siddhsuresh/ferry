@@ -1,54 +1,48 @@
 //! keel-ffi JSON layer — the exact wire contract Swift decodes.
 //!
-//! Faithful port of `ferry/kernel/send_to_js/{structs.go,main.go}` (the output
-//! envelopes and their `Send*` builders) and `ferry/kernel/structs.go` (the input
-//! decode types), plus the `toJson` serializer in `send_to_js/helpers.go`.
-//!
 //! This module owns the whole JSON contract: the wire **types**, the serializer
 //! ([`to_json`]), case-insensitive input decode ([`decode_input`]), and the
-//! `send_to_js.Send*` payload **builders** (one per operation). `abi.rs` reads
-//! input, calls `state`, and hands the domain result to the matching builder
-//! here; so the domain→wire mapping, the nil-slice `null` quirk, the literal-`Z`
-//! `dateAdded`, and elapsed-time all live in this one place.
+//! payload **builders** (one per operation). `abi.rs` reads input, calls
+//! `state`, and hands the domain result to the matching builder here; so the
+//! domain→wire mapping, the nil-slice `null` quirk, the literal-`Z` `dateAdded`,
+//! and elapsed-time all live in this one place.
 //!
-//! # Three casing regimes (docs/CONTRACTS.md keel-ffi/json, plan §2 crate 5)
-//! The Go kernel mixes three casing conventions in one payload tree, and Swift
-//! decodes them position-for-position, so keel must reproduce each exactly:
+//! # Three casing regimes (docs/CONTRACTS.md keel-ffi/json)
+//! The wire contract mixes three casing conventions in one payload tree, and
+//! Swift decodes them position-for-position, so each must be reproduced exactly:
 //!
-//! 1. **Envelope + `send_to_js` structs → camelCase.** `errorType`, `error`,
-//!    `data`, `isFolder`, `dateAdded`, `fullPath`, `filesSentProgress`, … These
-//!    come from Go `json:"..."` struct tags (send_to_js/structs.go).
-//! 2. **`mtpDeviceInfo` / `usbDeviceInfo` / storages → raw Go PascalCase.** The
-//!    Go structs `mtp.DeviceInfo`, `mtp.UsbDeviceInfo`, `mtp.StorageInfo`,
-//!    `mtpx.StorageData` carry NO json tags, so jsoniter emits the Go field name
-//!    verbatim: `StandardVersion`, `MTPVendorExtensionID`, `Sid`, `Info`,
+//! 1. **Envelope + camelCase payload structs.** `errorType`, `error`, `data`,
+//!    `isFolder`, `dateAdded`, `fullPath`, `filesSentProgress`, …
+//! 2. **`mtpDeviceInfo` / `usbDeviceInfo` / storages → raw PascalCase.** The
+//!    device-info and storage structs carry no rename tags, so the field name is
+//!    emitted verbatim: `StandardVersion`, `MTPVendorExtensionID`, `Sid`, `Info`,
 //!    `MaxCapability`, `FreeSpaceInBytes`, `StorageDescription`, … (golden
 //!    fixtures 0001–0003).
-//! 3. **`FileExists` data → all-lowercase `fullpath`.** The one field whose tag
-//!    is literally lowercase (send_to_js/structs.go:23 `json:"fullpath"`), unlike
-//!    every other `fullPath` in the tree (golden 0008).
+//! 3. **`FileExists` data → all-lowercase `fullpath`.** The one field whose key
+//!    is literally lowercase, unlike every other `fullPath` in the tree
+//!    (golden 0008).
 //!
-//! # `null` vs `[]` (the nil-slice quirk — preserved, plan §3.5)
-//! Go's `SendWalk`/`SendFileExists` build their slices with `append` onto a `nil`
-//! slice, and jsoniter marshals a `nil` slice as `null`, NOT `[]`. So an empty
-//! Walk emits `"data":null` (golden README). Modeled with [`null_if_empty`] →
-//! `Option<Vec<_>>`. By contrast the `mtp.DeviceInfo` arrays (`CaptureFormats`, …)
-//! arrive pre-populated (non-nil) from the wire decoder, so an empty one is `[]`
-//! (golden 0001 `"CaptureFormats":[]`) — those stay plain `Vec`.
+//! # `null` vs `[]` (the nil-slice quirk — required by the wire contract)
+//! The Walk and FileExists builders emit `"data":null`, not `[]`, for an empty
+//! result — the frozen contract distinguishes a nil slice (`null`) from a
+//! non-nil empty one (`[]`). Modeled with [`null_if_empty`] → `Option<Vec<_>>`.
+//! By contrast the device-info arrays (`CaptureFormats`, …) arrive pre-populated
+//! (non-nil) from the wire decoder, so an empty one is `[]` (golden 0001
+//! `"CaptureFormats":[]`) — those stay plain `Vec`.
 //!
-//! # Float formatting (jsoniter `MarshalFloatWith6Digits`)
-//! `toJson` uses `jsoniter.ConfigFastest`, whose float codec is
-//! `WriteFloatNLossy`: round to 6 fractional decimal digits, strip trailing
-//! zeros, and drop the fraction entirely when integral (so `100`, not `100.0`;
-//! `9.63`; `83.330971`). serde_json's native (ryu shortest round-trip) output
-//! DIFFERS (e.g. `66.66667` vs Go's `66.666672`), so [`to_json`] installs
-//! [`JsoniterFormatter`], a custom `serde_json` `Formatter` that ports
-//! `WriteFloat32Lossy`/`WriteFloat64Lossy` verbatim → byte-identical floats.
+//! # Float formatting (6-digit lossy)
+//! The wire contract formats floats by rounding to 6 fractional decimal digits,
+//! stripping trailing zeros, and dropping the fraction entirely when integral
+//! (so `100`, not `100.0`; `9.63`; `83.330971`). serde_json's native (ryu
+//! shortest round-trip) output DIFFERS (e.g. `66.66667` vs the required
+//! `66.666672`), so [`to_json`] installs [`CompactFloatFormatter`], a custom
+//! `serde_json` `Formatter` that reproduces the 6-digit lossy form →
+//! byte-identical floats.
 //!
 //! # No HTML escaping
-//! `jsoniter.ConfigFastest` sets `EscapeHTML:false`; serde_json's default
-//! `CompactFormatter` likewise leaves `< > &` and non-ASCII (emoji filenames)
-//! as raw UTF-8. Match, no configuration needed.
+//! The wire contract leaves `< > &` and non-ASCII (emoji filenames) as raw
+//! UTF-8. serde_json's default `CompactFormatter` does the same, so no
+//! configuration is needed.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,20 +51,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // ===========================================================================
-// Serializer: jsoniter-compatible float formatting
+// Serializer: 6-digit lossy float formatting
 // ===========================================================================
 
-/// A `serde_json` `Formatter` that emits floats the way `jsoniter.ConfigFastest`
-/// (`MarshalFloatWith6Digits`) does, and everything else exactly like the
-/// default `CompactFormatter` (all non-float methods use the trait defaults).
+/// A `serde_json` `Formatter` that emits floats in the wire contract's 6-digit
+/// lossy form, and everything else exactly like the default `CompactFormatter`
+/// (all non-float methods use the trait defaults).
 ///
-/// Ported from json-iterator/go `stream_float.go` `WriteFloat32Lossy` /
-/// `WriteFloat64Lossy`. Load-bearing: the golden progress payloads (fixtures
-/// 0011–0013) carry `filesSentProgress`/`progress` percentages that are NOT
-/// normalized by the conformance oracle, so they must be byte-identical.
-struct JsoniterFormatter;
+/// Load-bearing: the golden progress payloads (fixtures 0011–0013) carry
+/// `filesSentProgress`/`progress` percentages that are NOT normalized by the
+/// conformance oracle, so they must be byte-identical.
+struct CompactFloatFormatter;
 
-impl serde_json::ser::Formatter for JsoniterFormatter {
+impl serde_json::ser::Formatter for CompactFloatFormatter {
     fn write_f32<W: ?Sized + std::io::Write>(
         &mut self,
         writer: &mut W,
@@ -88,26 +81,25 @@ impl serde_json::ser::Formatter for JsoniterFormatter {
     }
 }
 
-/// Append the positive magnitude `mag` in jsoniter's 6-digit lossy form.
+/// Append the positive magnitude `mag` in the 6-digit lossy form.
 ///
-/// Verbatim port of the common tail of `WriteFloatNLossy` (stream_float.go):
-/// `lval = uint64(mag*1e6 + 0.5)`, print `lval/1e6`, then the 6-digit fraction
+/// `lval = (mag*1e6 + 0.5) as u64`, print `lval/1e6`, then the 6-digit fraction
 /// `lval%1e6` left-padded with zeros and right-stripped of zeros.
 fn append_lossy(out: &mut String, mag: f64) {
     const EXP: u64 = 1_000_000; // 10^6, precision = 6
     const POW10: [u64; 7] = [1, 10, 100, 1000, 10000, 100000, 1000000];
 
-    // Go: `uint64(mag*float64(exp) + 0.5)` — truncation toward zero of a
-    // positive value == round-half-up. Rust `as u64` truncates+saturates too.
+    // `(mag * exp + 0.5) as u64` — truncation toward zero of a positive value
+    // == round-half-up. `as u64` truncates and saturates.
     let lval = (mag * EXP as f64 + 0.5) as u64;
     out.push_str(&(lval / EXP).to_string());
 
     let fval = lval % EXP;
     if fval == 0 {
-        return; // integral → no fractional part (Go emits "100", "0")
+        return; // integral → no fractional part ("100", "0")
     }
     out.push('.');
-    // Left-pad the fraction to 6 digits (stream_float.go leading-zero loop).
+    // Left-pad the fraction to 6 digits.
     let mut p: i32 = 5; // precision - 1
     while p > 0 && fval < POW10[p as usize] {
         out.push('0');
@@ -120,10 +112,10 @@ fn append_lossy(out: &mut String, mag: f64) {
     }
 }
 
-/// `WriteFloat32Lossy` (stream_float.go). `0x4ffffff` = 83_886_079 is jsoniter's
-/// cutover to full-precision formatting; above it (and for non-finite values,
-/// which never reach a progress/speed field) we fall back to a best-effort
-/// shortest form — a documented, effectively-dead deviation (plan §3.4).
+/// 6-digit lossy formatting for `f32`. `0x4ffffff` = 83_886_079 is the cutover
+/// to full-precision formatting; above it (and for non-finite values, which
+/// never reach a progress/speed field) we fall back to a best-effort shortest
+/// form — an effectively-dead deviation.
 fn float32_lossy(val: f32) -> String {
     let mut out = String::new();
     let (neg, mag) = if val < 0.0 { (true, -val) } else { (false, val) };
@@ -138,7 +130,7 @@ fn float32_lossy(val: f32) -> String {
     out
 }
 
-/// `WriteFloat64Lossy` (stream_float.go). See [`float32_lossy`] for the cutover.
+/// 6-digit lossy formatting for `f64`. See [`float32_lossy`] for the cutover.
 fn float64_lossy(val: f64) -> String {
     let mut out = String::new();
     let (neg, mag) = if val < 0.0 { (true, -val) } else { (false, val) };
@@ -153,14 +145,14 @@ fn float64_lossy(val: f64) -> String {
     out
 }
 
-/// Serialize any payload the way Go's `toJson` (send_to_js/helpers.go:124) does:
-/// compact, no HTML escaping, jsoniter-lossy floats. Go returns `""` on marshal
-/// failure; these plain structs never fail to serialize, but we mirror that
-/// fallback exactly rather than panic across the FFI boundary.
+/// Serialize any payload to the wire contract: compact, no HTML escaping,
+/// 6-digit lossy floats. Returns `""` on marshal failure; these plain structs
+/// never fail to serialize, but the fallback is here rather than panicking
+/// across the FFI boundary.
 pub fn to_json<T: Serialize>(value: &T) -> String {
     let mut buf = Vec::new();
     {
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, JsoniterFormatter);
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, CompactFloatFormatter);
         if value.serialize(&mut ser).is_err() {
             return String::new();
         }
@@ -172,10 +164,9 @@ pub fn to_json<T: Serialize>(value: &T) -> String {
 // Output envelope
 // ===========================================================================
 
-/// The `{errorType, error, data}` result envelope shared by every `send_to_js`
-/// `*Result` struct. Go declares them separately but structurally identical;
-/// one generic mirrors all of them, field order (errorType, error, data) fixed
-/// to match the Go struct declaration order jsoniter emits.
+/// The `{errorType, error, data}` result envelope shared by every operation's
+/// result. One generic covers them all; field order (errorType, error, data) is
+/// fixed by the wire contract.
 ///
 /// `error_type` is `&'static str` because the value is always either `""`
 /// (success) or one of [`crate::errors`]' fixed `ErrorType` constants.
@@ -188,7 +179,7 @@ pub struct Envelope<T: Serialize> {
 }
 
 impl<T: Serialize> Envelope<T> {
-    /// A success envelope: `errorType` and `error` are the Go zero value `""`.
+    /// A success envelope: `errorType` and `error` are the empty string.
     pub fn ok(data: T) -> Self {
         Envelope {
             error_type: "",
@@ -198,8 +189,7 @@ impl<T: Serialize> Envelope<T> {
     }
 }
 
-/// The error envelope (`send_to_js.ErrorResult`, main.go:30): `data` is Go's
-/// `interface{}` = `nil` → `null`. `()` serializes to `null`.
+/// The error envelope: `data` is `null`. `()` serializes to `null`.
 pub fn error_envelope(error_type: &'static str, error: String) -> Envelope<()> {
     Envelope {
         error_type,
@@ -209,12 +199,11 @@ pub fn error_envelope(error_type: &'static str, error: String) -> Envelope<()> {
 }
 
 // ===========================================================================
-// Regime 2: raw Go PascalCase — mtp.DeviceInfo / mtp.UsbDeviceInfo / storages
+// Regime 2: raw PascalCase — device info / USB device info / storages
 // ===========================================================================
 
-/// `send_to_js.DeviceInfo` (structs.go:84) — the `data` of Initialize /
-/// FetchDeviceInfo. Go uses `*mtp.DeviceInfo` pointers; on the success path both
-/// are always populated (the legacy kernel SendInitialize), so keel keeps them non-optional.
+/// The `data` of Initialize / FetchDeviceInfo. On the success path both fields
+/// are always populated, so they're kept non-optional.
 #[derive(Debug, Serialize)]
 pub struct DeviceInfoData {
     #[serde(rename = "mtpDeviceInfo")]
@@ -223,9 +212,9 @@ pub struct DeviceInfoData {
     pub usb_device_info: UsbDeviceInfo,
 }
 
-/// Raw PascalCase mirror of `mtp.DeviceInfo` (go-mtpfs types.go:22). No json tags
-/// in Go ⇒ field names are the wire keys (golden 0001). Arrays are plain `Vec`
-/// (never nil off the wire decoder) so an empty one serializes `[]`, not `null`.
+/// Raw PascalCase device info. No rename tags ⇒ the field names are the wire
+/// keys (golden 0001). Arrays are plain `Vec` (never nil off the wire decoder)
+/// so an empty one serializes `[]`, not `null`.
 #[derive(Debug, Serialize)]
 pub struct MtpDeviceInfo {
     #[serde(rename = "StandardVersion")]
@@ -258,8 +247,8 @@ pub struct MtpDeviceInfo {
     pub serial_number: String,
 }
 
-/// Raw PascalCase mirror of `mtp.UsbDeviceInfo` (go-mtpfs mtp.go:49). `Device` is
-/// bcdDevice (golden 0001 `"Device":1537`).
+/// Raw PascalCase USB device info. `Device` is bcdDevice (golden 0001
+/// `"Device":1537`).
 #[derive(Debug, Serialize)]
 pub struct UsbDeviceInfo {
     #[serde(rename = "IdVendor")]
@@ -276,8 +265,8 @@ pub struct UsbDeviceInfo {
     pub serial_number: String,
 }
 
-/// Raw PascalCase mirror of `mtpx.StorageData` (go-mtpx structs.go:14) — the
-/// element of the FetchStorages `data` array (golden 0003).
+/// Raw PascalCase storage entry — the element of the FetchStorages `data` array
+/// (golden 0003).
 #[derive(Debug, Serialize)]
 pub struct StorageData {
     #[serde(rename = "Sid")]
@@ -286,7 +275,7 @@ pub struct StorageData {
     pub info: StorageInfo,
 }
 
-/// Raw PascalCase mirror of `mtp.StorageInfo` (go-mtpfs types.go:107).
+/// Raw PascalCase storage info.
 #[derive(Debug, Serialize)]
 pub struct StorageInfo {
     #[serde(rename = "StorageType")]
@@ -308,11 +297,11 @@ pub struct StorageInfo {
 }
 
 // ===========================================================================
-// Regime 1: camelCase — send_to_js payloads
+// Regime 1: camelCase payloads
 // ===========================================================================
 
-/// `send_to_js.FileInfo` (structs.go:10) — Walk `data` element. Note the tags:
-/// `isFolder` (not isDir), `dateAdded` (not modTime), `path` (not fullPath).
+/// Walk `data` element. Note the wire keys: `isFolder` (not isDir), `dateAdded`
+/// (not modTime), `path` (not fullPath).
 #[derive(Debug, Serialize)]
 pub struct FileInfo {
     pub size: i64,
@@ -333,16 +322,15 @@ pub struct FileInfo {
     pub object_id: u32,
 }
 
-/// `send_to_js.FileExistsData` (structs.go:22). Regime 3: `fullpath` is the one
-/// literally-lowercase key in the whole contract (golden 0008).
+/// FileExists `data` element. Regime 3: `fullpath` is the one literally-lowercase
+/// key in the whole contract (golden 0008).
 #[derive(Debug, Serialize)]
 pub struct FileExistsData {
     pub fullpath: String,
     pub exists: bool,
 }
 
-/// `send_to_js.TransferPreprocessData` (structs.go:27) — Upload/Download
-/// preprocess `data` (golden 0009/0010).
+/// Upload/Download preprocess `data` (golden 0009/0010).
 #[derive(Debug, Serialize)]
 pub struct TransferPreprocessData {
     #[serde(rename = "fullPath")]
@@ -351,10 +339,9 @@ pub struct TransferPreprocessData {
     pub size: i64,
 }
 
-/// `send_to_js.TransferProgressInfo` (structs.go:45) — Upload/Download progress
-/// `data` (golden 0011–0013). `speed` is f64; the two percentage fields are f32
-/// (matching `mtpx` `float32`), which the jsoniter-lossy formatter renders as
-/// Go does (`33.333336`, `100`).
+/// Upload/Download progress `data` (golden 0011–0013). `speed` is f64; the two
+/// percentage fields are f32, which the lossy formatter renders as `33.333336`,
+/// `100`.
 #[derive(Debug, Serialize)]
 pub struct TransferProgressInfo {
     #[serde(rename = "fullPath")]
@@ -375,12 +362,12 @@ pub struct TransferProgressInfo {
     pub active_file_size: TransferSizeInfo,
     #[serde(rename = "bulkFileSize")]
     pub bulk_file_size: TransferSizeInfo,
-    /// `mtpx.TransferStatus` — the string `"InProgress"` or `"Completed"`
-    /// (go-mtpx enums.go). Carried as the raw string the builder supplies.
+    /// The transfer status string `"InProgress"` or `"Completed"`. Carried as
+    /// the raw string the builder supplies.
     pub status: String,
 }
 
-/// `send_to_js.TransferSizeInfo` (structs.go:33).
+/// Per-file / bulk byte totals with a progress percentage.
 #[derive(Debug, Serialize)]
 pub struct TransferSizeInfo {
     pub total: i64,
@@ -389,28 +376,28 @@ pub struct TransferSizeInfo {
 }
 
 // ===========================================================================
-// Input decode (case-insensitive) — kernel/structs.go
+// Input decode (case-insensitive)
 // ===========================================================================
 
-/// Build the verbatim unmarshalling-error sentinel Go's the legacy kernel emits when
-/// input JSON fails to decode (legacy kernel L145/174/211/248/282/314/412).
+/// Build the unmarshalling-error sentinel emitted when input JSON fails to
+/// decode.
 ///
-/// Preserved BYTE-FOR-BYTE including the misspelling **"occured"** and the
-/// trailing `": "` with nothing after it. `op` is the operation name
-/// (`"MakeDirectory"`, `"Walk"`, …). The embedded `%+v` detail differs (serde vs
-/// jsoniter error text) — a documented deviation (plan §3.4); it never affects
-/// classification, which is `ErrorGeneral` regardless, and Swift does not parse
-/// the message body.
+/// Preserved BYTE-FOR-BYTE for the wire contract, including the misspelling
+/// **"occured"** and the trailing `": "` with nothing after it. `op` is the
+/// operation name (`"MakeDirectory"`, `"Walk"`, …). The embedded error detail
+/// differs from the original serializer's text — a deviation that never affects
+/// classification (always `ErrorGeneral`), and Swift does not parse the message
+/// body.
 pub fn unmarshalling_error(op: &str, err: &serde_json::Error) -> String {
     format!("error occured while Unmarshalling {op} input data {err}: ")
 }
 
-/// Decode an input payload with Go/jsoniter-style leniency:
-/// * **case-insensitive keys** — Swift sends `"files"`, the Go contract tag is
+/// Decode an input payload with lenient, case-insensitive semantics:
+/// * **case-insensitive keys** — Swift sends `"files"`, the contract key is
 ///   `"Files"`; both must decode (docs/CONTRACTS.md keel-ffi/json). Also covers
 ///   `storageId`/`StorageId`, etc.
 /// * **missing field → zero value** (`#[serde(default)]` on every input struct).
-/// * **explicit `null` → zero value** — jsoniter treats a null field as absent;
+/// * **explicit `null` → zero value** — a null field is treated as absent;
 ///   [`normalize_input`] drops null entries so the struct default applies (a
 ///   plain serde decode would instead error on `null` into `String`/`u32`).
 /// * **unknown fields ignored** (serde default).
@@ -421,10 +408,10 @@ pub fn decode_input<T: DeserializeOwned>(json: &str) -> Result<T, serde_json::Er
     serde_json::from_value(normalize_input(raw))
 }
 
-/// Recursively lowercase object keys (ASCII fold, matching Go's `equalFold` for
-/// ASCII tags) and drop `null`-valued entries (jsoniter null→zero-value
-/// leniency). Applied before deserializing into the lowercase-renamed input
-/// structs. Input payloads are flat objects, so this is cheap.
+/// Recursively lowercase object keys (ASCII fold) and drop `null`-valued entries
+/// (null → zero-value leniency). Applied before deserializing into the
+/// lowercase-renamed input structs. Input payloads are flat objects, so this is
+/// cheap.
 fn normalize_input(v: Value) -> Value {
     match v {
         Value::Object(map) => {
@@ -442,11 +429,11 @@ fn normalize_input(v: Value) -> Value {
     }
 }
 
-// Input structs mirror kernel/structs.go. Field renames are the ASCII-lowercase
-// form of each Go json tag, because `decode_input` lowercases the incoming keys
-// first. `#[serde(default)]` gives Go's missing-field zero values.
+// Field renames are the ASCII-lowercase form of each contract key, because
+// `decode_input` lowercases the incoming keys first. `#[serde(default)]` gives
+// the missing-field zero values.
 
-/// `MakeDirectoryInput` (kernel/structs.go:19).
+/// `MakeDirectory` input.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct MakeDirectoryInput {
@@ -456,7 +443,7 @@ pub struct MakeDirectoryInput {
     pub full_path: String,
 }
 
-/// `FetchThumbnailInput` — Ferry extension (no legacy-kernel counterpart).
+/// `FetchThumbnail` input — a Ferry extension.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct FetchThumbnailInput {
@@ -466,8 +453,8 @@ pub struct FetchThumbnailInput {
     pub full_path: String,
 }
 
-/// `FileExistsInput` (kernel/structs.go:24). Go tag is `"Files"` (capital F);
-/// Swift sends `"files"` — both fold to `"files"`.
+/// `FileExists` input. The contract key is `"Files"` (capital F); Swift sends
+/// `"files"` — both fold to `"files"`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct FileExistsInput {
@@ -477,7 +464,7 @@ pub struct FileExistsInput {
     pub files: Vec<String>,
 }
 
-/// `DeleteFileInput` (kernel/structs.go:29).
+/// `DeleteFile` input.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct DeleteFileInput {
@@ -487,7 +474,7 @@ pub struct DeleteFileInput {
     pub files: Vec<String>,
 }
 
-/// `RenameFileInput` (kernel/structs.go:34).
+/// `RenameFile` input.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct RenameFileInput {
@@ -499,7 +486,7 @@ pub struct RenameFileInput {
     pub new_file_name: String,
 }
 
-/// `WalkInput` (kernel/structs.go:40).
+/// `Walk` input.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct WalkInput {
@@ -515,7 +502,7 @@ pub struct WalkInput {
     pub skip_hidden_files: bool,
 }
 
-/// `UploadFilesInput` (kernel/structs.go:48).
+/// `UploadFiles` input.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct UploadFilesInput {
@@ -529,7 +516,7 @@ pub struct UploadFilesInput {
     pub preprocess_files: bool,
 }
 
-/// `DownloadFilesInput` (kernel/structs.go:55).
+/// `DownloadFiles` input.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct DownloadFilesInput {
@@ -544,21 +531,20 @@ pub struct DownloadFilesInput {
 }
 
 // ===========================================================================
-// Payload builders — the `send_to_js.Send*` functions (main.go)
+// Payload builders
 // ===========================================================================
 //
 // One per operation, each mapping keel domain types (keel-proto / keel-mtp /
 // keel-vfs) into the wire structs above and serialising via `to_json`. `abi.rs`
 // (exports) and `sampler.rs` (the 500 ms poller) call these.
 
-/// `SendInitialize` (main.go:42-54) — Initialize `data` = `{mtpDeviceInfo,
-/// usbDeviceInfo}`.
+/// Initialize `data` = `{mtpDeviceInfo, usbDeviceInfo}`.
 pub fn initialize_json(dev: &keel_proto::DeviceInfo, usb: &keel_mtp::session::UsbInfo) -> String {
     to_json(&Envelope::ok(device_info_data(dev, usb)))
 }
 
-/// `SendDeviceInfo` (main.go:56-68). Byte-identical shape to `initialize_json`
-/// (Go's `DeviceInfoResult` == `InitializeResult`); kept separate to mirror Go.
+/// FetchDeviceInfo `data`. Byte-identical shape to `initialize_json`; kept as a
+/// separate entry point per operation.
 pub fn device_info_json(dev: &keel_proto::DeviceInfo, usb: &keel_mtp::session::UsbInfo) -> String {
     to_json(&Envelope::ok(device_info_data(dev, usb)))
 }
@@ -595,16 +581,14 @@ fn device_info_data(
     }
 }
 
-/// `SendStorages` (main.go:70-79). Raw-PascalCase `[{Sid, Info{…}}]`.
+/// FetchStorages `data` — raw-PascalCase `[{Sid, Info{…}}]`.
 ///
-/// Unlike `SendWalk`/`SendFileExists` (which build via `append` onto a `nil` slice,
-/// so empty → `null`), Go assigns the returned slice **directly** (`Data: storages`).
-/// jsoniter therefore emits `null` only for a nil slice and `[]` for a non-nil empty
-/// one — so keel serialises the `Vec` **directly** here, not through `null_if_empty`
-/// (audit A1.1: applying the Walk/FileExists nil-quirk here was an over-generalised
-/// idiom that diverged from Go's direct assign). On the success path go-mtpx never
-/// returns an empty slice — it errors `NoStorage` for zero storages — so the empty
-/// case is unreachable either way; direct serialisation matches Go's code structure.
+/// Unlike `walk_json`/`file_exists_json` (empty → `null`), the storages array is
+/// serialised **directly**, so a non-nil empty set is `[]`, not `null` — this
+/// matches the wire contract, which distinguishes the two. On the success path
+/// an empty slice is unreachable (zero storages errors as `NoStorage`), but the
+/// shape must still be right, so the `Vec` is serialised directly rather than
+/// through `null_if_empty`.
 pub fn storages_json(storages: &[keel_vfs::device::StorageData]) -> String {
     let data: Vec<StorageData> = storages
         .iter()
@@ -625,7 +609,7 @@ pub fn storages_json(storages: &[keel_vfs::device::StorageData]) -> String {
     to_json(&Envelope::ok(data))
 }
 
-/// `SendMakeDirectory` (main.go:81-90): `data: true`.
+/// MakeDirectory result: `data: true`.
 pub fn make_directory_json() -> String {
     to_json(&Envelope::ok(true))
 }
@@ -657,10 +641,9 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// `SendFileExists` (main.go:92-111). Pairs each input path with its `exists`
-/// flag positionally: Go ranges over the result vec and indexes the input files
-/// by position (the result never exceeds the inputs, even on the batch-abort
-/// quirk). Empty → `null`.
+/// FileExists result. Pairs each input path with its `exists` flag positionally:
+/// the result never exceeds the inputs, even on the batch-abort quirk. Empty →
+/// `null`.
 pub fn file_exists_json(exists: &[bool], input_files: &[String]) -> String {
     let data: Vec<FileExistsData> = exists
         .iter()
@@ -673,19 +656,19 @@ pub fn file_exists_json(exists: &[bool], input_files: &[String]) -> String {
     to_json(&Envelope::ok(null_if_empty(data)))
 }
 
-/// `SendDeleteFile` (main.go:113-122): `data: true`.
+/// DeleteFile result: `data: true`.
 pub fn delete_file_json() -> String {
     to_json(&Envelope::ok(true))
 }
 
-/// `SendRenameFile` (main.go:124-133): `data: true`.
+/// RenameFile result: `data: true`.
 pub fn rename_file_json() -> String {
     to_json(&Envelope::ok(true))
 }
 
-/// `SendWalk` (main.go:135-162). Maps each `keel_vfs::FileInfo` to the camelCase
-/// wire struct, formatting `dateAdded` (see [`format_date_added`]). An empty walk
-/// serialises `data: null` (the nil-slice quirk — golden README).
+/// Walk result. Maps each `keel_vfs::FileInfo` to the camelCase wire struct,
+/// formatting `dateAdded` (see [`format_date_added`]). An empty walk serialises
+/// `data: null` (the nil-slice quirk).
 pub fn walk_json(files: &[keel_vfs::FileInfo]) -> String {
     let data: Vec<FileInfo> = files
         .iter()
@@ -704,7 +687,7 @@ pub fn walk_json(files: &[keel_vfs::FileInfo]) -> String {
     to_json(&Envelope::ok(null_if_empty(data)))
 }
 
-/// `SendUploadFilesPreprocess` (main.go:164-177). Fired from the sampler.
+/// Upload preprocess `data`. Fired from the sampler.
 pub fn upload_preprocess_json(full_path: &str, name: &str, size: i64) -> String {
     to_json(&Envelope::ok(TransferPreprocessData {
         full_path: full_path.to_string(),
@@ -713,8 +696,7 @@ pub fn upload_preprocess_json(full_path: &str, name: &str, size: i64) -> String 
     }))
 }
 
-/// `SendDownloadFilesPreprocess` (main.go:179-192). Same wire shape as the upload
-/// preprocess (Go builds the identical `TransferPreprocessData`).
+/// Download preprocess `data`. Same wire shape as the upload preprocess.
 pub fn download_preprocess_json(full_path: &str, name: &str, size: i64) -> String {
     to_json(&Envelope::ok(TransferPreprocessData {
         full_path: full_path.to_string(),
@@ -723,16 +705,15 @@ pub fn download_preprocess_json(full_path: &str, name: &str, size: i64) -> Strin
     }))
 }
 
-/// `SendTransferFilesProgress` (main.go:194-223). Maps `keel_vfs::ProgressInfo`
-/// to the wire struct. `elapsedTime` is computed HERE, exactly like Go's
-/// `time.Since(p.StartTime).Milliseconds()` (a wall-clock delta the conformance
-/// oracle normalises).
+/// Transfer progress result. Maps `keel_vfs::ProgressInfo` to the wire struct.
+/// `elapsedTime` is computed HERE as the milliseconds since `p.start_time` (a
+/// wall-clock delta the conformance oracle normalises).
 pub fn progress_json(p: &keel_vfs::ProgressInfo) -> String {
-    // Go: `time.Since(p.StartTime).Milliseconds()` — a SIGNED int64 that goes
-    // negative when StartTime is in the future (main.go:199). StartTime is set at
-    // transfer start, so the negative branch is unreachable in practice, but keel
-    // reproduces the sign rather than clamping to 0 (audit A1.4). `elapsedTime` is a
-    // conformance-normalised field, so this is behaviour-exact either way.
+    // `elapsedTime` is a SIGNED i64 that goes negative when `start_time` is in
+    // the future. `start_time` is set at transfer start, so the negative branch
+    // is unreachable in practice, but the sign is reproduced rather than clamped
+    // to 0. `elapsedTime` is a conformance-normalised field, so this is
+    // behaviour-exact either way.
     let now = SystemTime::now();
     let elapsed_time = match now.duration_since(p.start_time) {
         Ok(d) => d.as_millis() as i64,
@@ -761,23 +742,23 @@ pub fn progress_json(p: &keel_vfs::ProgressInfo) -> String {
     }))
 }
 
-/// `SendTransferFilesDone` (main.go:225-234): `data: true`.
+/// Transfer-done result: `data: true`.
 pub fn transfer_done_json() -> String {
     to_json(&Envelope::ok(true))
 }
 
-/// `SendDispose` (main.go:236-245): `data: true`.
+/// Dispose result: `data: true`.
 pub fn dispose_json() -> String {
     to_json(&Envelope::ok(true))
 }
 
-/// `SendError` (main.go:27-40): the error envelope, `data: null`.
+/// Error result: the error envelope, `data: null`.
 pub fn error_json(error_type: &'static str, error: String) -> String {
     to_json(&error_envelope(error_type, error))
 }
 
-/// Go's `append`-onto-nil-slice semantics: an empty result is `nil` → `null`, a
-/// non-empty one is an array. See the module-level "`null` vs `[]`" note.
+/// Nil-slice semantics: an empty result is `null`, a non-empty one is an array.
+/// See the module-level "`null` vs `[]`" note.
 fn null_if_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
     if v.is_empty() {
         None
@@ -786,19 +767,18 @@ fn null_if_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
     }
 }
 
-/// Format a `keel_vfs::FileInfo.mod_time` as Go's `DateTimeFormat`
-/// (`"2006-01-02T15:04:05.000Z"`, constants.go:3) does in `SendWalk`.
+/// Format a `keel_vfs::FileInfo.mod_time` as the wire contract's timestamp
+/// layout, `"2006-01-02T15:04:05.000Z"`.
 ///
-/// The trailing `Z` in that Go layout is a **literal** (a Go zone token needs
-/// `Z07:00`/`Z0700`), so Go formatted the `time.Time`'s wall-clock digits and
-/// appended a bare `Z` — never a real UTC conversion (plan §3.5 preserved quirk;
-/// a "correct" formatter would shift the timestamp). keel-proto decoded PTP
-/// datetimes AS UTC (codec.rs `decode_datetime`), so rendering the `SystemTime`
-/// in **UTC** civil time yields the device's original wall-clock digits, then the
-/// literal `Z` — reproducing Go's output (golden 0004). `dateAdded` is a
-/// conformance-normalised field, so this is behaviour-exact regardless.
+/// The trailing `Z` in that layout is a **literal**, not a zone token: the
+/// wall-clock digits are formatted and a bare `Z` is appended — never a real
+/// UTC conversion (a "correct" formatter would shift the timestamp). keel-proto
+/// decodes PTP datetimes AS UTC, so rendering the `SystemTime` in **UTC** civil
+/// time yields the device's original wall-clock digits, then the literal `Z`
+/// (golden 0004). `dateAdded` is a conformance-normalised field, so this is
+/// behaviour-exact regardless.
 ///
-/// `None` is Go's zero `time.Time{}`, which that layout renders as
+/// `None` is the zero timestamp, which that layout renders as
 /// `"0001-01-01T00:00:00.000Z"`.
 fn format_date_added(mod_time: Option<SystemTime>) -> String {
     const GO_ZERO_TIME: &str = "0001-01-01T00:00:00.000Z";
@@ -807,7 +787,7 @@ fn format_date_added(mod_time: Option<SystemTime>) -> String {
     };
     let (secs, millis) = match t.duration_since(UNIX_EPOCH) {
         Ok(d) => (d.as_secs() as i64, d.subsec_millis()),
-        // A pre-epoch instant keel-proto never produces; fall back to Go's zero.
+        // A pre-epoch instant keel-proto never produces; fall back to the zero timestamp.
         Err(_) => return GO_ZERO_TIME.to_string(),
     };
     let days = secs.div_euclid(86_400);
@@ -835,17 +815,17 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 #[cfg(test)]
-// Golden f32 percentages below are written with the exact digit sequence Go's
-// jsoniter emits (e.g. the literal `83.330971` mirrors the asserted output
-// string `"83.330971"`), so the test reads as a 1:1 golden check. Those extra
+// Golden f32 percentages below are written with the exact digit sequence the
+// wire contract emits (e.g. the literal `83.330971` mirrors the asserted output
+// string `"83.330971"`), so the test reads as a direct golden check. Those extra
 // digits are redundant for f32 — the literal rounds to the identical bit
 // pattern regardless — so clippy::excessive_precision would suggest truncating
-// them; we keep the full digits deliberately for the golden correspondence.
+// them; the full digits are kept deliberately for the golden correspondence.
 #[allow(clippy::excessive_precision)]
 mod tests {
     use super::*;
 
-    // ---- float formatting (jsoniter lossy) -------------------------------
+    // ---- float formatting (6-digit lossy) --------------------------------
 
     #[test]
     fn lossy_floats_match_golden() {
@@ -864,7 +844,7 @@ mod tests {
 
     #[test]
     fn lossy_floats_computed_like_go() {
-        // Percentages computed the go-mtpx way: (sent/total)*100 as f32.
+        // Percentages computed as (sent/total)*100 in f32.
         let p = |s: f32, t: f32| (s / t) * 100.0_f32;
         assert_eq!(float32_lossy(p(1.0, 3.0)), "33.333336");
         assert_eq!(float32_lossy(p(2.0, 3.0)), "66.666672");
@@ -934,10 +914,10 @@ mod tests {
 
     #[test]
     fn storages_json_empty_is_bracket_not_null() {
-        // audit A1.1: Go assigns the slice directly (SendStorages), so a non-nil
-        // empty storages set serialises `[]`, unlike the append-onto-nil Walk /
-        // FileExists arms which are `null`. (Unreachable on the happy path —
-        // go-mtpx errors NoStorage for zero storages — but the shape must match Go.)
+        // The storages slice is serialised directly, so a non-nil empty set is
+        // `[]`, unlike the Walk / FileExists arms which are `null`. (Unreachable
+        // on the happy path — zero storages errors as NoStorage — but the shape
+        // must match the wire contract.)
         assert_eq!(
             storages_json(&[]),
             r#"{"errorType":"","error":"","data":[]}"#
@@ -1023,8 +1003,8 @@ mod tests {
 
     #[test]
     fn initialize_json_matches_full_golden_0001() {
-        // End-to-end byte parity against the real Go-kernel fixture (embedded at
-        // compile time), built from keel domain types.
+        // End-to-end byte parity against the golden fixture (embedded at compile
+        // time), built from keel domain types.
         let golden = include_str!("../../../fixtures/golden/0001.json").trim_end();
         let dev = keel_proto::DeviceInfo {
             standard_version: 100,
@@ -1109,7 +1089,7 @@ mod tests {
 
     #[test]
     fn no_html_escaping_of_special_chars() {
-        // jsoniter EscapeHTML:false — <, >, & stay raw (serde_json default).
+        // No HTML escaping — <, >, & stay raw (serde_json default).
         let d = FileExistsData {
             fullpath: "/a<b>&c".to_string(),
             exists: true,
@@ -1121,7 +1101,7 @@ mod tests {
 
     #[test]
     fn input_decode_accepts_swift_lowercase_files() {
-        // Swift sends "files"; Go contract tag is "Files".
+        // Swift sends "files"; the contract key is "Files".
         let i: FileExistsInput =
             decode_input(r#"{"storageId":65537,"files":["/a","/b"]}"#).unwrap();
         assert_eq!(i.storage_id, 65537);
@@ -1150,7 +1130,7 @@ mod tests {
 
     #[test]
     fn input_decode_missing_and_null_fields_default() {
-        // Missing storageId → 0; explicit null destination → "" (jsoniter parity).
+        // Missing storageId → 0; explicit null destination → "" (null leniency).
         let i: UploadFilesInput =
             decode_input(r#"{"sources":["/a"],"destination":null,"preprocessFiles":true}"#)
                 .unwrap();

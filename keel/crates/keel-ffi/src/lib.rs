@@ -1,5 +1,5 @@
 //! keel-ffi — the frozen-ABI cdylib. Exact ABI + JSON contract.
-//! Reference: ferry/kernel/{the legacy kernel,send_to_js/*}. See docs/CONTRACTS.md.
+//! See docs/CONTRACTS.md.
 mod abi;
 mod json;
 mod errors;

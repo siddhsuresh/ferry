@@ -1,23 +1,21 @@
-//! `--via-ffi` mode — `dlopen` the built `libkeel.dylib` and drive the exact
-//! the frozen C ABI, exercising the real cdylib boundary (not keel-vfs directly).
+//! `--via-ffi` mode — `dlopen` the built `libkeel.dylib` and drive the frozen
+//! C ABI, exercising the real cdylib boundary (not keel-vfs directly).
 //!
-//! The ABI is the one KeelFFI.swift wraps (KeelFFI.swift:1-33): every export
-//! takes an optional JSON input string plus one or more `on_cb_result_t`
-//! callbacks. The header declares the callback param as `on_cb_result_t*` but the
-//! Go/Rust shim treats the *value* as the function pointer itself
-//! (KeelFFI.swift:14-19), so the effective ABI passes the callback fn pointer
-//! directly — that is what we do here.
+//! Every export takes an optional JSON input string plus one or more
+//! `on_cb_result_t` callbacks. The header declares the callback param as
+//! `on_cb_result_t*`, but the shim treats the *value* as the function pointer
+//! itself, so the effective ABI passes the callback fn pointer directly — that
+//! is what we do here.
 //!
 //! Callbacks fire synchronously (done) or from the kernel's 500 ms sampler thread
 //! (preprocess/progress) before the export returns; each hands us a malloc'd,
 //! NUL-terminated payload it transfers ownership of. We copy it out, free it, and
-//! record it: printed raw to stdout, or written to `--dump-dir/%04d.json` EXACTLY
-//! like Swift's `GoldenDump` (KeelFFI.swift:96-112) with a single shared,
-//! monotonically-increasing counter across all callbacks.
+//! record it: printed raw to stdout, or written to `--dump-dir/%04d.json` with a
+//! single shared, monotonically-increasing counter across all callbacks.
 //!
-//! This module is the crate's only `unsafe`: the task mandates
-//! `libc::dlopen`/`dlsym` + `extern "C"` callback trampolines. Every unsafe op
-//! is wrapped in an explicit block with a SAFETY note.
+//! This module is the crate's only `unsafe`: `libc::dlopen`/`dlsym` +
+//! `extern "C"` callback trampolines. Every unsafe op is wrapped in an explicit
+//! block with a SAFETY note.
 
 use std::error::Error;
 use std::ffi::{CStr, CString};
@@ -36,7 +34,7 @@ const GOLDEN_BASE: &str = "/Download/keel-golden-test";
 const SOAK_BASE: &str = "/Download/keel-soak";
 
 // ---------------------------------------------------------------------------
-// C ABI types (KeelFFI.swift:25-34)
+// C ABI types
 // ---------------------------------------------------------------------------
 
 /// `typedef void (*on_cb_result_t)(char*)`.
@@ -47,11 +45,11 @@ type FnCb = unsafe extern "C" fn(OnCbResult);
 type FnJsonCb = unsafe extern "C" fn(*const c_char, OnCbResult);
 /// `void UploadFiles(char* json, on_cb_result_t* onPre, *onProg, *onDone)`.
 type FnJson3Cb = unsafe extern "C" fn(*const c_char, OnCbResult, OnCbResult, OnCbResult);
-/// `void CancelTransfer()` — the Ferry extension (legacy kernel L28-31).
+/// `void CancelTransfer()` — the Ferry cancel extension.
 type FnVoid = unsafe extern "C" fn();
 
 // ---------------------------------------------------------------------------
-// Payload sink — the GoldenDump analogue
+// Payload sink
 // ---------------------------------------------------------------------------
 
 enum CbKind {
@@ -66,9 +64,8 @@ struct Sink {
     last_done: Option<String>,
 }
 
-/// Process-global sink. C callbacks can't capture context and the legacy kernel ABI has
-/// no user-data pointer (KeelFFI.swift:36-42), so payloads route through a
-/// global — same shape as the Swift `KeelCallbackSlots`. A `Mutex` because
+/// Process-global sink. C callbacks can't capture context and the ABI has no
+/// user-data pointer, so payloads route through a global. A `Mutex` because
 /// preprocess/progress arrive on the kernel's sampler thread while done arrives
 /// on the calling thread.
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
@@ -82,8 +79,7 @@ fn install_sink(dump_dir: Option<PathBuf>) {
 }
 
 /// Record a payload: bump the shared counter, remember the last done payload, and
-/// either dump it to `%04d.json` (Swift GoldenDump, KeelFFI.swift:103-111) or
-/// print it raw to stdout.
+/// either dump it to `%04d.json` or print it raw to stdout.
 fn record(kind: CbKind, payload: String) {
     let mut guard = SINK.lock().unwrap();
     let Some(sink) = guard.as_mut() else {
@@ -128,14 +124,14 @@ extern "C" fn cb_prog(p: *mut c_char) {
     record(CbKind::Prog, take_cstr(p));
 }
 
-/// Copy a legacy kernel payload out of its C string and free it (KeelFFI.swift:85-91).
+/// Copy a payload out of its C string and free it.
 fn take_cstr(p: *mut c_char) -> String {
     if p.is_null() {
         return String::new();
     }
     // SAFETY: the ABI hands us a malloc'd, NUL-terminated C string and transfers
-    // ownership (Go's C.CString / keel-ffi's malloc-backed CString). Copy it out,
-    // then free with libc::free to match the C allocator (Swift does the same).
+    // ownership (keel-ffi's malloc-backed CString). Copy it out, then free with
+    // libc::free to match the C allocator.
     unsafe {
         let s = CStr::from_ptr(p).to_string_lossy().into_owned();
         libc::free(p as *mut c_void);
@@ -163,7 +159,7 @@ struct Kernel {
     walk: FnJsonCb,
     upload_files: FnJson3Cb,
     download_files: FnJson3Cb,
-    /// Optional — absent on unpatched upstream kernels (KeelFFI.swift:162-164).
+    /// Optional — absent on kernels built without the cancel extension.
     cancel_transfer: Option<FnVoid>,
 }
 
@@ -171,8 +167,8 @@ fn open_lib(path: &Path) -> Result<Kernel, String> {
     let cpath = CString::new(path.as_os_str().to_string_lossy().as_bytes())
         .map_err(|_| "library path contains a NUL byte".to_string())?;
 
-    // SAFETY: standard dlopen — cpath is a valid NUL-terminated path. RTLD_LOCAL
-    // + RTLD_NOW mirror KeelFFI.swift:178.
+    // SAFETY: standard dlopen — cpath is a valid NUL-terminated path, opened with
+    // RTLD_LOCAL + RTLD_NOW.
     let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
         return Err(format!("dlopen({}) failed: {}", path.display(), dlerror_str()));
@@ -191,7 +187,7 @@ fn open_lib(path: &Path) -> Result<Kernel, String> {
         walk: sym(handle, "Walk")?,
         upload_files: sym(handle, "UploadFiles")?,
         download_files: sym(handle, "DownloadFiles")?,
-        // CancelTransfer is optional (KeelFFI.swift:202-203).
+        // CancelTransfer is optional.
         cancel_transfer: sym::<FnVoid>(handle, "CancelTransfer").ok(),
     })
 }
@@ -201,7 +197,7 @@ fn sym<T>(handle: *mut c_void, name: &str) -> Result<T, String> {
     // SAFETY: `handle` is a live dlopen handle. dlsym returns null (missing) or a
     // valid function pointer. Every `T` we instantiate is an `extern "C" fn`
     // pointer (pointer-sized), so transmute_copy from the pointer-sized dlsym
-    // result is size-correct (KeelFFI.swift:182-187 does the same bit-cast).
+    // result is size-correct.
     unsafe {
         let raw = libc::dlsym(handle, cname.as_ptr());
         if raw.is_null() {
@@ -235,7 +231,7 @@ impl Kernel {
     fn call_json(&self, f: FnJsonCb, json: &str) -> String {
         let c = CString::new(json).unwrap_or_default();
         // SAFETY: c stays alive for the whole (blocking) call; the export copies
-        // the input before returning (borrowed-input contract, plan keel-ffi/abi).
+        // the input before returning (borrowed-input contract).
         unsafe { f(c.as_ptr(), cb_done) };
         last_done()
     }
@@ -283,8 +279,7 @@ impl Kernel {
 }
 
 // ---------------------------------------------------------------------------
-// JSON input builders — exactly the keys the Swift KeelEngine emits
-// (KeelEngine.swift:61-124)
+// JSON input builders — the exact keys the frozen wire contract expects
 // ---------------------------------------------------------------------------
 
 fn walk_json(sid: u32, path: &str, recursive: bool) -> String {
@@ -299,8 +294,8 @@ fn walk_json(sid: u32, path: &str, recursive: bool) -> String {
 }
 
 fn exists_json(sid: u32, paths: &[String]) -> String {
-    // KeelEngine.swift:82 sends lowercase "files" (the Go struct tag is "Files",
-    // decoded case-insensitively by keel-ffi); reproduce the Swift spelling.
+    // Send lowercase "files"; keel-ffi decodes the key case-insensitively. Kept
+    // for wire compatibility with the app.
     serde_json::json!({ "storageId": sid, "files": paths }).to_string()
 }
 
@@ -353,7 +348,7 @@ fn payload_error(payload: &str) -> String {
         .unwrap_or_else(|| payload.to_string())
 }
 
-/// Parse `data[0].Sid` out of a FetchStorages payload (golden fixture 0003 shape:
+/// Parse `data[0].Sid` out of a FetchStorages payload (shape:
 /// `{"data":[{"Sid":65537,...}]}`); `--storage` overrides it.
 fn parse_sid(payload: &str, opts: &Options) -> Option<u32> {
     if let Some(s) = opts.storage {
@@ -399,7 +394,7 @@ pub fn run(cmd: Command, opts: &Options) -> Result<(), Box<dyn Error>> {
     log::info!("loaded {}", lib_path.display());
 
     match cmd {
-        // Initialize IS the device-info fetch (the legacy kernel Initialize sends it).
+        // Initialize also performs the device-info fetch.
         Command::Info => {
             k.init();
             k.dispose_dev();
@@ -461,7 +456,7 @@ pub fn run(cmd: Command, opts: &Options) -> Result<(), Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// golden via FFI — reproduces the Swift `--golden` GoldenDump byte sequence
+// golden via FFI — the scripted session driven over the C ABI
 // ---------------------------------------------------------------------------
 
 fn ffi_step(name: &str, payload: String) {
@@ -495,8 +490,8 @@ fn ffi_golden(k: &Kernel, opts: &Options) -> Result<(), Box<dyn Error>> {
     ffi_step("Walk /", k.walk_op(&walk_json(sid, "/", false)));
     ffi_step("Walk /Download", k.walk_op(&walk_json(sid, "/Download", false)));
 
-    // MakeDirectory (fresh + idempotent repeat) — two separate exports so the
-    // dump gets two `data:true` payloads (golden fixtures 0006/0007).
+    // MakeDirectory (fresh + idempotent repeat) — two separate calls so the
+    // dump gets two `data:true` payloads.
     ffi_step("MakeDirectory #1", k.mkdir(&mkdir_json(sid, base)));
     ffi_step("MakeDirectory #2", k.mkdir(&mkdir_json(sid, base)));
 
@@ -550,7 +545,7 @@ fn ffi_golden(k: &Kernel, opts: &Options) -> Result<(), Box<dyn Error>> {
     );
 
     // Error-shape fixtures — operations against missing paths (payloads dumped;
-    // the step itself always "passes", like Swift's try?).
+    // the step itself always "passes" since the errors are swallowed).
     let _ = k.walk_op(&walk_json(sid, &format!("{base}/no-such-dir"), false));
     let _ = k.rename(&rename_json(
         sid,
@@ -576,7 +571,7 @@ fn ffi_golden(k: &Kernel, opts: &Options) -> Result<(), Box<dyn Error>> {
 // ---------------------------------------------------------------------------
 // soak via FFI — upload+download loop, cancel injected across threads via
 // CancelTransfer (an atomic store the kernel polls while the transfer blocks
-// the calling thread — plan keel-ffi/cancel).
+// the calling thread).
 // ---------------------------------------------------------------------------
 
 fn report_ffi(label: &str, payload: &str) {
@@ -596,9 +591,9 @@ fn arm_canceller(cancel: Option<FnVoid>, fire_ms: Option<u64>) -> Option<thread:
     println!("  (cancel armed: +{ms}ms)");
     Some(thread::spawn(move || {
         thread::sleep(Duration::from_millis(ms));
-        // SAFETY: CancelTransfer takes no args and only does an atomic store
-        // (legacy kernel L28-31 / plan keel-ffi/cancel); safe to call from any thread
-        // while the transfer blocks the main thread. Fn pointers are Send.
+        // SAFETY: CancelTransfer takes no args and only does an atomic store;
+        // safe to call from any thread while the transfer blocks the main thread.
+        // Fn pointers are Send.
         unsafe { f() };
     }))
 }
@@ -676,7 +671,7 @@ fn resolve_lib_path(opts: &Options) -> Result<PathBuf, Box<dyn Error>> {
             .join(name),
     );
     // Relative to the working dir: run from keel/ (target/…) or keel/crates/
-    // (../target/…, the literal path in the task).
+    // (../target/…).
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("target").join(sub).join(name));
         candidates.push(cwd.join("../target").join(sub).join(name));

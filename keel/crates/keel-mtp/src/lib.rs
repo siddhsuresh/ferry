@@ -1,5 +1,5 @@
-//! keel-mtp — session, transaction engine, the 13 operations + android ext.
-//! Ported from go-mtpfs mtp/{mtp,ops,android}.go per docs/CONTRACTS.md.
+//! keel-mtp — session, transaction engine, the 13 operations plus the Android
+//! vendor extensions.
 pub mod transport;
 pub mod session;
 pub mod transaction;

@@ -1,17 +1,16 @@
-//! The device lifecycle exports — go-mtpx `main.go` `Initialize` (18-36),
-//! `Dispose` (39-41), `FetchDeviceInfo` (44-53), and `FetchStorages` (56-81).
+//! The device lifecycle exports — `initialize`, `dispose`, `fetch_device_info`,
+//! and `fetch_storages`.
 //!
-//! In Go these are free functions over an `*mtp.Device` that bundles USB handle,
-//! session, and probe. keel splits that: `keel-usb` discovers/opens/claims/probes
-//! and hands back a live [`Transport`], and `keel-mtp` runs the session ladder.
-//! So [`Device`] here is a thin wrapper over a configured
-//! `MtpSession<UsbTransport>`, and these four are its constructor + methods.
+//! `keel-usb` discovers/opens/claims/probes and hands back a live [`Transport`],
+//! and `keel-mtp` runs the session ladder. [`Device`] here is a thin wrapper over
+//! a configured `MtpSession<UsbTransport>`, and these four are its constructor +
+//! methods.
 //!
-//! Error wrapping mirrors Go one-for-one: discover failure →
-//! [`VfsError::MtpDetectFailed`] (except the exclusive-access case, peeled off as
-//! [`VfsError::ExclusiveAccess`]); session-ladder failure →
-//! [`VfsError::Configure`]; GetDeviceInfo → [`VfsError::DeviceInfo`]; the storage
-//! ops → [`VfsError::StorageInfo`] / [`VfsError::NoStorage`].
+//! Error wrapping: discover failure → [`VfsError::MtpDetectFailed`] (except the
+//! exclusive-access case, peeled off as [`VfsError::ExclusiveAccess`]);
+//! session-ladder failure → [`VfsError::Configure`]; GetDeviceInfo →
+//! [`VfsError::DeviceInfo`]; the storage ops → [`VfsError::StorageInfo`] /
+//! [`VfsError::NoStorage`].
 
 use keel_mtp::MtpSession;
 use keel_mtp::session::UsbInfo as MtpUsbInfo;
@@ -20,16 +19,15 @@ use keel_usb::{DiscoverError, Discovered, UsbInfo, UsbTransport, discover};
 
 use crate::error::VfsError;
 
-/// go-mtpx `Init` (structs.go:11-13). Options for [`initialize`].
+/// Options for [`initialize`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Init {
-    /// Go's `Init.DebugMode`, which set `dev.{MTP,Data,USB}Debug`. keel routes
-    /// wire debugging through the `log`/`env_logger` facade (plan §2), so this
-    /// flag is currently advisory — see the open issues returned to the gate.
+    /// Request wire-level debug logging. keel routes wire debugging through the
+    /// `log`/`env_logger` facade, so this flag is currently advisory.
     pub debug_mode: bool,
 }
 
-/// go-mtpx `StorageData` (structs.go:15-18): a storage ID paired with its info.
+/// A storage ID paired with its info.
 #[derive(Clone, Debug)]
 pub struct StorageData {
     pub sid: u32,
@@ -37,18 +35,17 @@ pub struct StorageData {
 }
 
 /// A live MTP device: a configured session over the USB transport, plus the USB
-/// identity captured at discovery. The keel analogue of go-mtpx's `*mtp.Device`.
+/// identity captured at discovery.
 pub struct Device {
     session: MtpSession<UsbTransport>,
 }
 
 /// Map a keel-usb discovery failure into the vfs taxonomy.
 ///
-/// Go wraps *every* `SelectDeviceWithDebugging` failure as `MtpDetectFailedError`
-/// (main.go:21-24). keel keeps that for all cases except the ptpcamerad /
-/// Image-Capture exclusive-access one, which it peels off into
-/// [`VfsError::ExclusiveAccess`] (a keel extension) so the FFI can name the
-/// blocking process instead of reporting a generic detect failure.
+/// Every discovery failure becomes [`VfsError::MtpDetectFailed`], except the
+/// ptpcamerad / Image-Capture exclusive-access one, which is peeled off into
+/// [`VfsError::ExclusiveAccess`] so the FFI can name the blocking process instead
+/// of reporting a generic detect failure.
 impl From<DiscoverError> for VfsError {
     fn from(e: DiscoverError) -> Self {
         match e {
@@ -58,30 +55,27 @@ impl From<DiscoverError> for VfsError {
     }
 }
 
-/// go-mtpx `Initialize` (main.go:18-36).
+/// Initialize a device.
 ///
-/// Discover the device (`SelectDeviceWithDebugging("")` → [`discover`]), then run
-/// the session ladder (`dev.Configure()` → [`MtpSession::configure`]). The 15 s
-/// `devTimeout` Go installs before `Configure` (main.go:29) is already applied
-/// inside `configure` (keel-mtp `SESSION_TIMEOUT`). The USB identity keel-usb
-/// returns alongside the transport is installed onto the session so later
-/// `usb_info()` reads (FFI `usbDeviceInfo`, the device-change serial compare)
-/// have it — Go got this for free because `Open()` populated it on the device.
+/// Discover the device ([`discover`]), then run the session ladder
+/// ([`MtpSession::configure`]). The 15 s session timeout is applied inside
+/// `configure` (keel-mtp `SESSION_TIMEOUT`). The USB identity keel-usb returns
+/// alongside the transport is installed onto the session so later `usb_info()`
+/// reads (the FFI `usbDeviceInfo` call, the device-change serial compare) have it.
 pub fn initialize(opts: Init) -> Result<Device, VfsError> {
     let Init { debug_mode } = opts;
     if debug_mode {
         log::debug!("keel-vfs initialize: debug mode requested");
     }
 
-    // main.go:19 — device selection (+ open/claim/probe). The `?` maps
-    // DiscoverError via `From` above: ExclusiveAccess → ExclusiveAccess,
-    // everything else → MtpDetectFailed (main.go:23).
+    // Device selection (+ open/claim/probe). The `?` maps DiscoverError via `From`
+    // above: ExclusiveAccess → ExclusiveAccess, everything else → MtpDetectFailed.
     let Discovered {
         transport,
         usb_info,
     } = discover()?;
 
-    // main.go:31 — dev.Configure(): the OpenSession recovery ladder.
+    // Configure: the OpenSession recovery ladder.
     let mut session = MtpSession::configure(transport).map_err(VfsError::Configure)?;
 
     // Install the USB descriptor identity captured at discovery.
@@ -102,27 +96,27 @@ fn to_mtp_usb_info(u: UsbInfo) -> MtpUsbInfo {
 }
 
 impl Device {
-    /// go-mtpx `Initialize` — see the free [`initialize`] function.
+    /// Initialize a device — see the free [`initialize`] function.
     pub fn initialize(opts: Init) -> Result<Device, VfsError> {
         initialize(opts)
     }
 
-    /// go-mtpx `Dispose` (main.go:39-41): `dev.Close()`. Consumes the device.
+    /// Close the device, consuming it.
     pub fn dispose(self) {
         self.session.close();
     }
 
-    /// go-mtpx `FetchDeviceInfo` (main.go:44-53).
+    /// Fetch the device info.
     pub fn fetch_device_info(&mut self) -> Result<DeviceInfo, VfsError> {
         self.session.device_info().map_err(VfsError::DeviceInfo)
     }
 
-    /// go-mtpx `FetchStorages` (main.go:56-81): GetStorageIDs, error out if none,
-    /// then GetStorageInfo per ID.
+    /// Fetch the storages: GetStorageIDs, error out if none, then GetStorageInfo
+    /// per ID.
     pub fn fetch_storages(&mut self) -> Result<Vec<StorageData>, VfsError> {
         let sids = self.session.storage_ids().map_err(VfsError::StorageInfo)?;
 
-        // main.go:62 — `len(sids.Values) < 1`.
+        // No storages available.
         if sids.is_empty() {
             return Err(VfsError::NoStorage);
         }

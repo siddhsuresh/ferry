@@ -1,10 +1,5 @@
 //! The 12-byte little-endian MTP bulk container header and its framing.
 //!
-//! Ported from go-mtpfs `mtp/types.go:155-168` (`usbBulkHeader`,
-//! `usbBulkContainer`, `usbHdrLen`, `usbBulkLen`) and `mtp/mtp.go` (`sendReq`
-//! lines 291-318 for encode, `fetchPacket`/`decodeRep` lines 322-361 for
-//! decode). Container-type constants are `USB_CONTAINER_*` (const.go:1929-1933).
-//!
 //! Wire layout (little-endian), 12 bytes:
 //! ```text
 //!   offset 0  u32  Length          (header + payload; 0xFFFFFFFF saturated)
@@ -15,18 +10,16 @@
 
 use crate::error::ProtoError;
 
-/// Length of the bulk container header in bytes (Go `usbHdrLen = 2*2 + 2*4`).
+/// Length of the bulk container header in bytes (two u16s + two u32s).
 pub const HDR_LEN: u32 = 12;
 
-/// Maximum number of `u32` parameters in a command/response container
-/// (Go `usbBulkContainer.Param [5]uint32`, types.go:164).
+/// Maximum number of `u32` parameters in a command/response container.
 pub const MAX_PARAMS: usize = 5;
 
 /// The kind of a bulk container, from the header `Type` field.
 ///
-/// Discriminants match `USB_CONTAINER_*` (const.go:1929-1933). `Default` is
-/// `Command` because `Container::default()` is used to build outgoing requests
-/// in keel-mtp.
+/// `Default` is `Command` because `Container::default()` is used to build
+/// outgoing requests in keel-mtp.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ContainerKind {
@@ -46,8 +39,9 @@ impl TryFrom<u16> for ContainerKind {
             2 => Ok(ContainerKind::Data),
             3 => Ok(ContainerKind::Response),
             4 => Ok(ContainerKind::Event),
-            // Go stored the raw uint16 and only later rejected non-RESPONSE in
-            // decodeRep (mtp.go:340); we reject truly-out-of-range types here.
+            // Reject only truly-out-of-range types here; a valid but unexpected
+            // kind (e.g. Data where Response was wanted) decodes fine and is
+            // left for the caller to catch.
             other => Err(ProtoError::BadContainerType(other)),
         }
     }
@@ -55,9 +49,8 @@ impl TryFrom<u16> for ContainerKind {
 
 /// An MTP request/response/event container.
 ///
-/// Corresponds to go-mtpfs `mtp.Container` (types.go:14-19) minus `SessionID`
-/// (which keel-mtp stamps at the transaction layer, not on the wire header —
-/// note the on-wire `usbBulkHeader` has no session field). `params` holds up to
+/// Has no `SessionID`: keel-mtp stamps that at the transaction layer, and the
+/// on-wire bulk header carries no session field. `params` holds up to
 /// [`MAX_PARAMS`] `u32` values; header encode/decode never touch them (the
 /// caller appends/parses parameter bytes around the header).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -74,12 +67,9 @@ impl Container {
     /// the data-phase byte count for a data container).
     ///
     /// The `Length` field is `HDR_LEN + payload_len`, **saturated to
-    /// `0xFFFFFFFF`** when the total exceeds 32 bits — the >4 GiB sentinel from
-    /// go-mtpfs `bulkWrite` (mtp.go:533-537):
-    /// ```go
-    /// if size+usbHdrLen > 0xFFFFFFFF { hdr.Length = 0xFFFFFFFF }
-    /// else { hdr.Length = uint32(size + usbHdrLen) }
-    /// ```
+    /// `0xFFFFFFFF`** when the total exceeds 32 bits — the >4 GiB sentinel: any
+    /// header-inclusive total that overflows a `u32` is clamped to `0xFFFFFFFF`
+    /// rather than truncated.
     pub fn encode_header(&self, payload_len: u64) -> [u8; 12] {
         let total = HDR_LEN as u64 + payload_len;
         let length = if total > 0xFFFF_FFFF {
@@ -100,9 +90,9 @@ impl Container {
     ///
     /// Returns the [`Container`] (with `params` left empty — parameters live in
     /// the bytes *after* the header and are parsed by the caller from the raw
-    /// `Length`) and the raw `Length` field. Mirrors `fetchPacket` +
-    /// `decodeRep` (mtp.go:322-352): the header is read first, then the caller
-    /// uses `Length - HDR_LEN` to know how many parameter/data bytes follow.
+    /// `Length`) and the raw `Length` field. The header is read first, then the
+    /// caller uses `Length - HDR_LEN` to know how many parameter/data bytes
+    /// follow.
     pub fn decode_header(buf: &[u8]) -> Result<(Container, u32), ProtoError> {
         if buf.len() < HDR_LEN as usize {
             return Err(ProtoError::Truncated {
@@ -191,7 +181,7 @@ mod tests {
     #[test]
     fn encode_saturation_boundary_is_exact() {
         let c = Container::default();
-        // total == 0xFFFFFFFF exactly => NOT saturated (Go: `>` not `>=`).
+        // total == 0xFFFFFFFF exactly => NOT saturated (strict `>`, not `>=`).
         let just_under = 0xFFFF_FFFFu64 - HDR_LEN as u64;
         assert_eq!(
             u32::from_le_bytes(c.encode_header(just_under)[0..4].try_into().unwrap()),

@@ -1,17 +1,15 @@
-//! keel-ffi error classifier — a faithful, order-preserving port of
-//! `processError` (ferry/kernel/send_to_js/helpers.go:12-121).
+//! keel-ffi error classifier — maps a kernel error to `(ErrorType, message)`.
 //!
-//! The Go function takes an untyped `error` and returns `(ErrorType, message)`
-//! that the FFI puts in the error envelope. Swift then classifies purely on the
-//! `errorType` string (22 canonical values, enums.go). The evaluation order is
-//! load-bearing and is reproduced here step-for-step:
+//! Takes an untyped error and returns `(ErrorType, message)` for the error
+//! envelope. Swift classifies purely on the `errorType` string (22 canonical
+//! values). The evaluation order is load-bearing:
 //!
-//! 1. **cancellation first** (early return) — typed `TransferCancelledError`
-//!    OR the substring `"transfer cancelled by user"`.
-//! 2. **typed switch** — Go's `switch v := e.(type)` over the bare `mtp.RCError`
-//!    (0x2009 special) and the 13 `mtpx.*Error` types.
+//! 1. **cancellation first** (early return) — the typed cancelled error OR the
+//!    substring `"transfer cancelled by user"`.
+//! 2. **typed switch** — over the bare `RCError` (0x2009 special) and the typed
+//!    vfs error variants.
 //! 3. **string-equality fallthrough** (only if step 2 left `errorType == ""`) —
-//!    the kernel-fabricated sentinels `"ErrorMtpDetectFailed"` /
+//!    the fabricated sentinels `"ErrorMtpDetectFailed"` /
 //!    `"ErrorMtpLockExists"` / `"ErrorDeviceChanged"`, else `ErrorGeneral`.
 //! 4. **substring overrides** (in this exact precedence) — `allow storage
 //!    access`, `device is not open`, `LIBUSB_ERROR_NO_DEVICE` (only when the
@@ -22,35 +20,35 @@
 //! cleaner dependency direction — `state.rs`/`abi.rs` depend on `errors.rs`, not
 //! the reverse). `state.rs` constructs it (the session helpers, the FetchStorages
 //! EOF wrap); `abi.rs` fires it through the callback; this module classifies it.
-//! Its two variants match Go's two `processError` operands exactly:
-//!   * [`KernelError::Vfs`] — a typed [`VfsError`] (Go's type-switch operand). A
-//!     bare `mtp.RCError` arrives here as `VfsError::Mtp(MtpError::Rc(..))` (the
-//!     contract's "bare passthrough"); a code wrapped in `FileObjectError` etc.
-//!     matches its own variant, never the RCError case — mirroring Go.
-//!   * [`KernelError::Message`] — a fabricated string (Go's `fmt.Errorf`
-//!     sentinels, the unmarshalling error, the FetchStorages EOF wrap).
+//! Its two variants are the two classifier operands:
+//!   * [`KernelError::Vfs`] — a typed [`VfsError`] (the type-switch operand). A
+//!     bare `RCError` arrives here as `VfsError::Mtp(MtpError::Rc(..))` (the
+//!     contract's "bare passthrough"); a code wrapped in `FileObject` etc.
+//!     matches its own variant, never the RCError case.
+//!   * [`KernelError::Message`] — a fabricated string (the sentinels, the
+//!     unmarshalling error, the FetchStorages EOF wrap).
 //!
-//! Preserved upstream bugs (plan §3.5, Swift UI depends on them):
-//! * `mtp.RCError == 0x2009` → `ErrorStorageFull`. 0x2009 is actually
+//! Preserved quirk (the Swift UI depends on it, so it's part of the wire
+//! contract):
+//! * `RCError == 0x2009` → `ErrorStorageFull`. 0x2009 is actually
 //!   `InvalidObjectHandle`; the mapping is wrong but Swift keys on it, so it
 //!   stays. The message even remains `"InvalidObjectHandle"`.
 //!
-//! keel extension (no Go analogue): [`VfsError::ExclusiveAccess`] →
-//! `ErrorDeviceSetup` with an owner-named message, so Swift's existing
-//! `isDeviceSetupFailure` UX lights up with a precise competing-app name. Kept
-//! inside the typed switch; it never disturbs the 22 canonical values.
+//! Extra variant: [`VfsError::ExclusiveAccess`] → `ErrorDeviceSetup` with an
+//! owner-named message, so Swift's existing `isDeviceSetupFailure` UX lights up
+//! with a precise competing-app name. Kept inside the typed switch; it never
+//! disturbs the 22 canonical values.
 
 use keel_mtp::MtpError;
 use keel_vfs::VfsError;
 
-/// The single error value every export funnels into `SendError` — the keel
-/// analogue of Go's untyped `error` reaching `send_to_js.processError`.
-/// Constructed by `state.rs`/`abi.rs`; classified by [`process_error`].
+/// The single error value every export funnels into `SendError`. Constructed by
+/// `state.rs`/`abi.rs`; classified by [`process_error`].
 #[derive(Debug)]
 pub enum KernelError {
-    /// A typed keel-vfs error — the operand of Go's `processError` type switch.
+    /// A typed keel-vfs error — the operand of the classifier's type switch.
     Vfs(VfsError),
-    /// A bare fabricated-string error — the operand of Go's string fallthrough
+    /// A bare fabricated-string error — the operand of the string fallthrough
     /// (`"ErrorMtpDetectFailed"`/`"ErrorDeviceChanged"`/`"ErrorMtpLockExists"`,
     /// the unmarshalling sentinel, the `"error allow storage access. …"` wrap).
     Message(String),
@@ -58,8 +56,8 @@ pub enum KernelError {
 
 impl std::fmt::Display for KernelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Go's `e.Error()`: the embedded-error types rendered their wrapped
-        // message; the fabricated string errors were themselves the message.
+        // The typed variant renders its wrapped message; a fabricated string
+        // error is itself the message.
         match self {
             KernelError::Vfs(e) => write!(f, "{e}"),
             KernelError::Message(s) => write!(f, "{s}"),
@@ -69,8 +67,8 @@ impl std::fmt::Display for KernelError {
 
 impl std::error::Error for KernelError {}
 
-/// The `send_to_js` `ErrorType` string set (enums.go) — the exact wire values
-/// Swift classifies on. Success is the empty string `""` (handled in `json.rs`).
+/// The `ErrorType` string set — the exact wire values Swift classifies on.
+/// Success is the empty string `""` (handled in `json.rs`).
 pub mod error_type {
     pub const MTP_DETECT_FAILED: &str = "ErrorMtpDetectFailed";
     pub const MTP_LOCK_EXISTS: &str = "ErrorMtpLockExists";
@@ -95,8 +93,8 @@ pub mod error_type {
     pub const GENERAL: &str = "ErrorGeneral";
 }
 
-/// keel-only message for [`VfsError::ExclusiveAccess`]. Names the competing app
-/// so Swift's `isDeviceSetupFailure` UX can tell the user exactly what to quit.
+/// Message for [`VfsError::ExclusiveAccess`]. Names the competing app so Swift's
+/// `isDeviceSetupFailure` UX can tell the user exactly what to quit.
 fn exclusive_access_message(owner: Option<&str>) -> String {
     match owner {
         Some(o) => format!("{o} is using the phone. Quit it and reconnect."),
@@ -104,13 +102,12 @@ fn exclusive_access_message(owner: Option<&str>) -> String {
     }
 }
 
-/// Port of `send_to_js.processError`. Returns `(errorType, errorMsg)`.
-///
-/// Steps and precedence exactly mirror helpers.go:12-121; see the module docs.
+/// Classify a [`KernelError`] into `(errorType, errorMsg)`. Steps and precedence
+/// are described in the module docs.
 pub fn process_error(err: &KernelError) -> (&'static str, String) {
-    let e_error = err.to_string(); // Go's e.Error(), computed once
+    let e_error = err.to_string(); // the rendered message, computed once
 
-    // ---- 1. cancellation FIRST (helpers.go:15-18) ------------------------
+    // ---- 1. cancellation FIRST -------------------------------------------
     // Typed sentinel OR the substring fallback (a transport layer may have
     // wrapped the sentinel on the way up).
     let is_cancel_type = matches!(err, KernelError::Vfs(VfsError::Cancelled));
@@ -118,23 +115,23 @@ pub fn process_error(err: &KernelError) -> (&'static str, String) {
         return (error_type::TRANSFER_CANCELLED, e_error);
     }
 
-    // ---- 2. typed switch (helpers.go:20-79) ------------------------------
-    // Go leaves errorType == "" for unmatched types (and for a bare RCError
-    // whose code != 0x2009), deferring to steps 3/4.
+    // ---- 2. typed switch -------------------------------------------------
+    // Leaves errorType == "" for unmatched types (and for a bare RCError whose
+    // code != 0x2009), deferring to steps 3/4.
     let mut error_type_str: &'static str = "";
     let mut error_msg = String::new();
 
     match err {
         KernelError::Vfs(v) => match v {
-            // case mtp.RCError (via the bare-passthrough variant): 0x2009 →
-            // ErrorStorageFull (preserved upstream bug). Message stays the RC
-            // name ("InvalidObjectHandle"). Must precede the catch-all Mtp arm.
+            // Bare RCError (via the bare-passthrough variant): 0x2009 →
+            // ErrorStorageFull (preserved quirk). Message stays the RC name
+            // ("InvalidObjectHandle"). Must precede the catch-all Mtp arm.
             VfsError::Mtp(MtpError::Rc(rc)) if rc.code() == 0x2009 => {
                 error_type_str = error_type::STORAGE_FULL;
                 error_msg = e_error.clone();
             }
-            // Any other bare mtp.RCError / bare MtpError → no typed match; Go's
-            // RCError case only sets a type for 0x2009. Falls to steps 3/4.
+            // Any other bare RCError / bare MtpError → no typed match; only
+            // 0x2009 sets a type here. Falls to steps 3/4.
             VfsError::Mtp(_) => {}
             VfsError::MtpDetectFailed(_) => {
                 error_type_str = error_type::MTP_DETECT_FAILED;
@@ -188,7 +185,7 @@ pub fn process_error(err: &KernelError) -> (&'static str, String) {
                 error_type_str = error_type::SEND_OBJECT;
                 error_msg = e_error.clone();
             }
-            // keel extension — kept in the typed switch so it slots in ahead of
+            // Extra variant — kept in the typed switch so it slots in ahead of
             // the string/substring logic without disturbing the 22 values.
             VfsError::ExclusiveAccess { owner } => {
                 error_type_str = error_type::DEVICE_SETUP;
@@ -201,7 +198,7 @@ pub fn process_error(err: &KernelError) -> (&'static str, String) {
         KernelError::Message(_) => {}
     }
 
-    // ---- 3. string-equality fallthrough (helpers.go:82-97) ---------------
+    // ---- 3. string-equality fallthrough ----------------------------------
     if error_type_str.is_empty() {
         if e_error == "ErrorMtpDetectFailed" {
             error_type_str = error_type::MTP_DETECT_FAILED;
@@ -218,12 +215,12 @@ pub fn process_error(err: &KernelError) -> (&'static str, String) {
         }
     }
 
-    // ---- 4. substring overrides (helpers.go:100-118) ---------------------
-    // Go tests `errorMsg` (which, at this point, always equals e.Error() for
-    // every Go-reachable case) and then resets `errorMsg = e.Error()`. We keep
-    // the exact if/else-if precedence. The `LIBUSB_ERROR_NO_DEVICE` override is
-    // gated on the type already being ErrorDeviceInfo (so only a DeviceInfoError
-    // carrying a device-gone transport error is re-tagged DeviceChanged).
+    // ---- 4. substring overrides ------------------------------------------
+    // Tests `errorMsg` (which at this point always equals the rendered message)
+    // and then resets `errorMsg`. The if/else-if precedence is exact. The
+    // `LIBUSB_ERROR_NO_DEVICE` override is gated on the type already being
+    // ErrorDeviceInfo (so only a DeviceInfo error carrying a device-gone
+    // transport error is re-tagged DeviceChanged).
     if error_msg.contains("allow storage access") {
         error_type_str = error_type::ALLOW_STORAGE_ACCESS;
         error_msg = e_error.clone();
@@ -249,11 +246,10 @@ pub fn process_error(err: &KernelError) -> (&'static str, String) {
     (error_type_str, error_msg)
 }
 
-/// Build the verbatim FetchStorages Samsung-workaround sentinel Go emits when
-/// `FetchStorages` returns an EOF (legacy kernel L115):
-/// `fmt.Errorf("error allow storage access. %+v", err.Error())`. `state.rs` calls
-/// this so the `"allow storage access"` substring [`process_error`] overrides on
-/// is produced from a single verbatim source.
+/// Build the FetchStorages Samsung-workaround sentinel emitted when
+/// `FetchStorages` returns an EOF: `"error allow storage access. {inner}"`.
+/// `state.rs` calls this so the `"allow storage access"` substring
+/// [`process_error`] overrides on is produced from a single verbatim source.
 pub fn allow_storage_access_sentinel(inner: &str) -> String {
     format!("error allow storage access. {inner}")
 }
@@ -303,7 +299,7 @@ mod tests {
         }
     }
 
-    // ---- string-fallthrough sentinels (helpers.go:82-97) -----------------
+    // ---- string-fallthrough sentinels ------------------------------------
 
     #[test]
     fn fabricated_string_sentinels() {
@@ -328,11 +324,11 @@ mod tests {
         assert_eq!(t2, et::TRANSFER_CANCELLED);
     }
 
-    // ---- the preserved 0x2009 upstream bug -------------------------------
+    // ---- the preserved 0x2009 quirk --------------------------------------
 
     #[test]
     fn bare_rc_0x2009_maps_to_storage_full_bug() {
-        // 0x2009 is InvalidObjectHandle, but Go maps it to ErrorStorageFull and
+        // 0x2009 is InvalidObjectHandle, but it maps to ErrorStorageFull and
         // leaves the message as the RC name. Preserved.
         let (t, m) = process_error(&rc(0x2009));
         assert_eq!(t, et::STORAGE_FULL);

@@ -1,5 +1,4 @@
 //! keel-proto — PTP/MTP wire types and codec. Pure, no I/O.
-//! Ported from go-mtpfs mtp/{const,encoding,types}.go per docs/CONTRACTS.md.
 pub mod consts;
 pub mod container;
 pub mod codec;

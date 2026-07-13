@@ -1,19 +1,17 @@
 //! Path normalization and path → object-handle resolution.
 //!
-//! Ports go-mtpx `utils.go` (`fixSlash`, `getFullPath` and their `path.Clean`
-//! dependency) and the `helpers.go` resolvers `GetObjectFromParentIdAndFilename`
-//! (83-114), `GetObjectFromPath` (118-172), and `GetObjectFromObjectIdOrPath`
-//! (176-201). The FileInfo-from-handle constructor (`GetObjectFromObjectId`)
+//! Provides the path helpers (`fix_slash`, `get_full_path`, and their lexical
+//! `path_clean` dependency) and the resolvers
+//! [`get_object_from_parent_id_and_filename`], [`get_object_from_path`], and
+//! [`get_object_from_object_id_or_path`]. The FileInfo-from-handle constructor
 //! lives in `object.rs` as [`from_object_id`].
 //!
 //! Resolution walks the path segment by segment from the storage root
 //! (`0xFFFFFFFF`): for each segment it lists the parent's children
-//! (`GetObjectHandles(parent, format=0)` — 0 == *all* formats, go-mtpfs's
-//! `GOH_ALL_ASSOCS` misnomer notwithstanding), reads each child's
-//! `OPC_ObjectFileName` and Unicode-case-insensitively compares it to the
-//! segment, then re-verifies the match against the object's `ObjectInfo.Filename`
-//! (the double check Go performs, helpers.go:98 & 108). The caller's casing is
-//! echoed back into the returned `full_path` (helpers.go:169).
+//! (`GetObjectHandles(parent, format=0)` — 0 means *all* formats), reads each
+//! child's `OPC_ObjectFileName` and Unicode-case-insensitively compares it to the
+//! segment, then re-verifies the match against the object's `ObjectInfo.Filename`.
+//! The caller's casing is echoed back into the returned `full_path`.
 //!
 //! Generic over [`Transport`] — only `device.rs` names the concrete USB type.
 //! [`FileProp`] is defined here (the sibling `dirops` module imports it as
@@ -25,30 +23,25 @@ use keel_proto::{ObjectPropCode, PropValue};
 use crate::error::VfsError;
 use crate::object::{FileInfo, from_object_id};
 
-/// go-mtpx `PathSep` (const.go:8) = `string(os.PathSeparator)`. Ferry is macOS,
-/// so this is `"/"` (the Go kernel only ever ran on macOS).
+/// The path separator. Ferry targets macOS, so this is `"/"`.
 pub const PATH_SEP: &str = "/";
 
-/// go-mtpx `ParentObjectId` (const.go:10) = go-mtpfs `GOH_ROOT_PARENT`
-/// (const.go:878) = `0xFFFFFFFF`. The synthetic parent handle of a storage root.
+/// The synthetic parent handle of a storage root (`0xFFFFFFFF`).
 pub const PARENT_OBJECT_ID: u32 = 0xFFFF_FFFF;
 
-/// go-mtpfs `GOH_ALL_ASSOCS` (const.go:875) = `0x00000000`. The ObjectFormatCode
-/// filter for `GetObjectHandles`; `0` means "all formats", NOT "associations" —
-/// the constant's name is a lie the plan (§2 keel-vfs/path) says to preserve, so
-/// keel does not "fix" it.
+/// The ObjectFormatCode filter for `GetObjectHandles`. `0` means "all formats",
+/// not "associations" — despite what the constant name in some MTP stacks implies.
 pub const FORMAT_ALL: u16 = 0x0000;
 
-/// go-mtpx `FileProp` (structs.go:93-96): an object addressed by handle and/or
-/// path. `object_id == 0` means "resolve by `full_path` instead". Defined here;
-/// `dirops.rs` imports it for the metadata ops.
+/// An object addressed by handle and/or path. `object_id == 0` means "resolve by
+/// `full_path` instead". Defined here; `dirops.rs` imports it for the metadata ops.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileProp {
     pub object_id: u32,
     pub full_path: String,
 }
 
-/// go-mtpx `fixSlash` (utils.go:55-63): ensure a leading `/`, then `path.Clean`.
+/// Ensure a leading `/`, then lexically clean the path.
 pub fn fix_slash(abs_filepath: &str) -> String {
     let s = if abs_filepath.starts_with(PATH_SEP) {
         abs_filepath.to_string()
@@ -58,17 +51,16 @@ pub fn fix_slash(abs_filepath: &str) -> String {
     path_clean(&s)
 }
 
-/// go-mtpx `getFullPath` (utils.go:47-53): join parent + `/` + filename, cleaned.
+/// Join parent + `/` + filename, then clean.
 pub fn get_full_path(parent_path: &str, filename: &str) -> String {
     fix_slash(&format!("{parent_path}{PATH_SEP}{filename}"))
 }
 
-/// Faithful port of Go's `path.Clean` (the `path` package, not `path/filepath`),
-/// which `fixSlash` calls. Purely lexical: collapse `//`, drop `.`, resolve `..`
-/// against preceding elements (and swallow `..` at the root). Operates on bytes —
-/// `path.Clean` only ever inspects the ASCII `/` and `.` bytes, and UTF-8
-/// continuation bytes are all ≥ 0x80, so byte-wise processing preserves any
-/// multibyte filename unchanged.
+/// Lexically clean a path, which `fix_slash` calls. Purely lexical: collapse `//`,
+/// drop `.`, resolve `..` against preceding elements (and swallow `..` at the
+/// root). Operates on bytes — only the ASCII `/` and `.` bytes are ever inspected,
+/// and UTF-8 continuation bytes are all ≥ 0x80, so byte-wise processing preserves
+/// any multibyte filename unchanged.
 fn path_clean(path: &str) -> String {
     let path = path.as_bytes();
     if path.is_empty() {
@@ -78,12 +70,12 @@ fn path_clean(path: &str) -> String {
     let rooted = path[0] == b'/';
     let n = path.len();
 
-    // Go's `lazybuf` is a write buffer with a length index `w`; the `..`
-    // backtrack peeks at `buf[w]` — the byte *just past* the logical end (still
-    // in the backing array) — to find the previous separator without erasing it.
-    // A Rust `Vec` that actually pops can't peek past its end, so mirror the
-    // lazybuf directly: a fixed buffer plus an explicit `w`. `path.Clean`'s output
-    // is never longer than its input, so a buffer of length `n` always suffices.
+    // A write buffer with a length index `w`; the `..` backtrack peeks at `buf[w]`
+    // — the byte *just past* the logical end (still in the backing array) — to find
+    // the previous separator without erasing it. A `Vec` that actually pops can't
+    // peek past its end, so use a fixed buffer plus an explicit `w`. The cleaned
+    // output is never longer than the input, so a buffer of length `n` always
+    // suffices.
     let mut buf = vec![0u8; n];
     let mut w = 0usize;
     let mut r = 0usize;
@@ -108,8 +100,7 @@ fn path_clean(path: &str) -> String {
             && path[r + 1] == b'.'
             && (r + 2 == n || path[r + 2] == b'/')
         {
-            // `..` element — back up over the previous element (Go's `out.w--`
-            // then `for out.w > dotdot && out.index(out.w) != '/'`).
+            // `..` element — back up over the previous element.
             r += 2;
             if w > dotdot {
                 w -= 1;
@@ -152,25 +143,23 @@ fn path_clean(path: &str) -> String {
     String::from_utf8(buf[..w].to_vec()).unwrap_or_else(|_| ".".to_string())
 }
 
-/// go-mtpx `indexExists` (utils.go:65-78), specialized to the `[]string` case
-/// (the only type it is ever called with). `arr.len() > index`.
+/// Whether `index` is in bounds for `arr` (`arr.len() > index`).
 fn index_exists(arr: &[&str], index: usize) -> bool {
     arr.len() > index
 }
 
-/// go `strings.EqualFold` (helpers.go:98, 108) — Unicode case-insensitive
-/// comparison.
+/// Unicode case-insensitive string comparison.
 ///
-/// Go uses `unicode.SimpleFold` (case-folding orbits). keel's dependency budget
-/// excludes any Unicode-table crate, so this approximates via the full-Unicode
-/// lowercase mapping in `str`, which agrees with `SimpleFold` for every
-/// practical filename and is byte-identical to Go for ASCII. The rare divergent
-/// cases (e.g. the Kelvin sign, ſ, final sigma) do not occur in MTP filenames.
+/// keel's dependency budget excludes any Unicode-table crate, so this approximates
+/// case-folding via the full-Unicode lowercase mapping in `str`. That agrees with
+/// true case-folding for every practical filename and is exact for ASCII. The rare
+/// divergent cases (e.g. the Kelvin sign, ſ, final sigma) do not occur in MTP
+/// filenames.
 fn eq_fold(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
 
-/// go-mtpx `GetObjectFromParentIdAndFilename` (helpers.go:83-114).
+/// Resolve a single filename within a parent directory.
 ///
 /// List the parent's children (all formats), and for each read
 /// `OPC_ObjectFileName`; skip non-matches cheaply (avoids a full GetObjectInfo
@@ -197,18 +186,16 @@ pub fn get_object_from_parent_id_and_filename<T: Transport>(
             _ => continue,
         };
 
-        // Cheap pre-filter on the property value (helpers.go:98).
+        // Cheap pre-filter on the property value.
         if !eq_fold(&prop_name, filename) {
             continue;
         }
 
-        // Deviation from helpers.go:104: Go re-wraps GetObjectFromObjectId's error
-        // in another FileObjectError; `from_object_id` already returns
-        // VfsError::FileObject, so keel propagates it directly (same
-        // classification, same RC substring).
+        // `from_object_id` already returns VfsError::FileObject, so propagate it
+        // directly rather than re-wrapping.
         let fi = from_object_id(session, object_id, "")?;
 
-        // Re-verify against ObjectInfo.Filename (helpers.go:108).
+        // Re-verify against the object's real filename.
         if eq_fold(&fi.name, filename) {
             return Ok(fi);
         }
@@ -219,21 +206,22 @@ pub fn get_object_from_parent_id_and_filename<T: Transport>(
     )))
 }
 
-/// go-mtpx `GetObjectFromPath` (helpers.go:118-172).
+/// Resolve an absolute path to its object.
 ///
 /// Empty input → `InvalidPath`. Root (`/`) → the synthetic root object. Otherwise
 /// split the cleaned path and resolve each segment against the running parent
 /// handle; a missing segment becomes `InvalidPath` ("path not found"), and a
 /// non-directory segment with more path after it is also `InvalidPath`. The
 /// returned object's `full_path` is overwritten with the cleaned input path so
-/// the caller's casing is echoed back (helpers.go:169).
+/// the caller's casing is echoed back.
 pub fn get_object_from_path<T: Transport>(
     session: &mut MtpSession<T>,
     storage_id: u32,
     full_path: &str,
 ) -> Result<FileInfo, VfsError> {
     if full_path.is_empty() {
-        // helpers.go:120 — note the capital-E "Exists" is Go's own wording.
+        // The capital-E "Exists" is intentional: this exact message is part of the
+        // frozen wire contract.
         return Err(VfsError::InvalidPath(format!(
             "path does not Exists. path: {full_path}"
         )));
@@ -246,7 +234,7 @@ pub fn get_object_from_path<T: Transport>(
     }
 
     // fix_slash guarantees a leading '/', so split yields ["", seg1, seg2, …];
-    // skip the leading empty element (skipIndex = 1).
+    // skip the leading empty element.
     let splitted: Vec<&str> = file_path.split(PATH_SEP).collect();
     const SKIP_INDEX: usize = 1;
 
@@ -258,19 +246,18 @@ pub fn get_object_from_path<T: Transport>(
         let cur =
             match get_object_from_parent_id_and_filename(session, storage_id, object_id, f_name) {
                 Ok(v) => v,
-                // FileNotFound → "path not found" InvalidPath (helpers.go:141-144).
+                // FileNotFound → "path not found" InvalidPath.
                 Err(VfsError::FileNotFound(reason)) => {
                     return Err(VfsError::InvalidPath(format!(
                         "path not found: {full_path}\nreason: {reason}"
                     )));
                 }
-                // Any other error propagates unchanged (helpers.go:146-147).
+                // Any other error propagates unchanged.
                 Err(e) => return Err(e),
             };
 
-        // A non-directory segment followed by more path is invalid
-        // (helpers.go:151-153). `i + 1 + SKIP_INDEX` indexes the *next* segment
-        // in the full split.
+        // A non-directory segment followed by more path is invalid.
+        // `i + 1 + SKIP_INDEX` indexes the *next* segment in the full split.
         if !cur.is_dir && index_exists(&splitted, i + 1 + SKIP_INDEX) {
             return Err(VfsError::InvalidPath(format!(
                 "path not found: {full_path}"
@@ -282,7 +269,7 @@ pub fn get_object_from_path<T: Transport>(
         result_count += 1;
     }
 
-    // helpers.go:165-167.
+    // Require at least one resolved segment.
     let mut fi = match fi {
         Some(f) if result_count >= 1 => f,
         _ => {
@@ -292,14 +279,12 @@ pub fn get_object_from_path<T: Transport>(
         }
     };
 
-    // Echo the caller's cleaned path back (helpers.go:169).
+    // Echo the caller's cleaned path back.
     fi.full_path = file_path;
     Ok(fi)
 }
 
-/// go-mtpx `GetObjectFromObjectIdOrPath` (helpers.go:176-201).
-///
-/// Prefer the handle; fall back to path resolution when `object_id == 0`. Both
+/// Resolve by handle, falling back to path resolution when `object_id == 0`. Both
 /// empty → `InvalidPath`.
 pub fn get_object_from_object_id_or_path<T: Transport>(
     session: &mut MtpSession<T>,
@@ -352,7 +337,7 @@ mod tests {
 
     #[test]
     fn eq_fold_is_case_insensitive() {
-        // ASCII — byte-identical to Go's strings.EqualFold (helpers.go:98/108).
+        // ASCII case-insensitive comparison.
         assert!(eq_fold("DCIM", "dcim"));
         assert!(eq_fold("IMG_0001.JPG", "img_0001.jpg"));
         assert!(!eq_fold("a", "b"));
@@ -361,10 +346,9 @@ mod tests {
 
     #[test]
     fn eq_fold_is_case_insensitive_unicode() {
-        // The Unicode filename compare go-mtpx relies on (per-segment sibling scan,
-        // helpers.go:98/108 `strings.EqualFold`). keel folds via `str::to_lowercase`
-        // (see eq_fold's doc): this agrees with Go's SimpleFold on every realistic
-        // filename. Latin-1 accents, Greek, Cyrillic, and full-width forms:
+        // The Unicode filename compare used per-segment during path resolution.
+        // Folding via `str::to_lowercase` (see eq_fold's doc) handles Latin-1
+        // accents, Greek, Cyrillic, and full-width forms:
         assert!(eq_fold("Résumé", "résumé"));
         assert!(eq_fold("CAFÉ.txt", "café.TXT"));
         assert!(eq_fold("Ünïcødé", "ünïcødé"));

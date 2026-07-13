@@ -1,21 +1,10 @@
-//! keel-vfs error taxonomy — the go-mtpx `errors.go` error set, plus the
-//! keel-only `ExclusiveAccess` passthrough.
+//! keel-vfs error taxonomy, plus the keel-only `ExclusiveAccess` passthrough.
 //!
-//! Ported from go-mtpx `errors.go` together with the `fmt.Errorf(...)` call
-//! sites in `main.go` / `helpers.go` / `utils.go` that supply each error's
-//! actual message. In Go every one of these types is an empty struct embedding
-//! the `error` interface:
-//!
-//! ```go
-//! type FileObjectError struct { error }
-//! ```
-//!
-//! so `.Error()` simply delegates to the wrapped error's message. The FFI mapper
-//! (`send_to_js/errors.go`) discriminates them by *type* (a Go type switch) and
-//! only falls back to substring-matching the message. keel mirrors that exactly:
-//! the enum variant is the "type", and `Display` reproduces the wrapped message
-//! verbatim so the FFI's substring overrides (`StoreFull`, `device is not open`,
-//! `LIBUSB_ERROR_NO_DEVICE`, `more than 1 device`, …) keep firing.
+//! Each variant wraps either an `MtpError` or a preformatted message. The FFI
+//! mapper discriminates these by *type* (the enum variant) and only falls back to
+//! substring-matching the message. So `Display` reproduces the wrapped message
+//! verbatim, keeping the FFI's substring overrides (`StoreFull`, `device is not
+//! open`, `LIBUSB_ERROR_NO_DEVICE`, `more than 1 device`, …) firing.
 //!
 //! Contract taxonomy (docs/CONTRACTS.md keel-vfs):
 //! `VfsError::{MtpDetectFailed, Configure, DeviceInfo, StorageInfo, NoStorage,
@@ -27,77 +16,63 @@ use std::fmt;
 
 use keel_mtp::MtpError;
 
-/// The go-mtpx error taxonomy (`errors.go`) + the `ExclusiveAccess` extension.
+/// The keel-vfs error taxonomy + the `ExclusiveAccess` extension.
 #[derive(Debug)]
 pub enum VfsError {
-    /// `MtpDetectFailedError{error: err}` (main.go:23) — device selection failed.
-    /// Wraps keel-usb's `DiscoverError` (which is not an `MtpError`), so keel
-    /// carries its rendered message; the FFI substring-matches e.g.
-    /// `"more than 1 device"` out of it, just as it did off Go's wrapped error.
+    /// Device selection failed. Wraps keel-usb's `DiscoverError` (which is not an
+    /// `MtpError`), so it carries the rendered message; the FFI substring-matches
+    /// e.g. `"more than 1 device"` out of it.
     MtpDetectFailed(String),
 
-    /// keel EXTENSION (no go-mtpx analogue, documented in docs/CONTRACTS.md
-    /// keel-usb). The USB device is held exclusively by another process
-    /// (ptpcamerad / Image Capture / Photos / Smart Switch, …). `owner` is the
-    /// IORegistry-named holder, best-effort. Peeled off the discover error at
-    /// `initialize` so the FFI can raise `ErrorDeviceSetup` with a
-    /// "Quit <owner> and try again" message instead of a generic detect failure.
+    /// keel extension (documented in docs/CONTRACTS.md keel-usb). The USB device is
+    /// held exclusively by another process (ptpcamerad / Image Capture / Photos /
+    /// Smart Switch, …). `owner` is the IORegistry-named holder, best-effort. Peeled
+    /// off the discover error at `initialize` so the FFI can raise `ErrorDeviceSetup`
+    /// with a "Quit <owner> and try again" message instead of a generic detect
+    /// failure.
     ExclusiveAccess { owner: Option<String> },
 
-    /// `ConfigureError{error: err}` (main.go:32) — the session ladder failed.
+    /// The session ladder failed.
     Configure(MtpError),
-    /// `DeviceInfoError{error: err}` (main.go:49).
+    /// GetDeviceInfo failed.
     DeviceInfo(MtpError),
-    /// `StorageInfoError{error: err}` (main.go:59, 71).
+    /// GetStorageIDs / GetStorageInfo failed.
     StorageInfo(MtpError),
-    /// `NoStorageError{fmt.Errorf("no storage found")}` (main.go:63).
+    /// No storage found on the device.
     NoStorage,
-    /// `ListDirectoryError{error: err}` (helpers.go:328) — GetObjectHandles in a
-    /// directory walk.
+    /// GetObjectHandles failed during a directory walk.
     ListDirectory(MtpError),
-    /// `FileNotFoundError{fmt.Errorf("file not found: %s", …)}` (helpers.go:113).
     /// An internal control-flow marker inside path resolution (mapped to
-    /// `InvalidPath` at the `GetObjectFromPath` boundary), carrying the formatted
-    /// message Go built.
+    /// `InvalidPath` at the `get_object_from_path` boundary), carrying the
+    /// formatted "file not found" message.
     FileNotFound(String),
-    /// `FilePermissionError{error: err}` — local-filesystem permission denial
-    /// (helpers.go / the upload+download local paths).
+    /// Local-filesystem permission denial (the upload/download local paths).
     FilePermission(String),
-    /// `LocalFileError{error: err}` — other local-filesystem error
-    /// (helpers.go / the upload+download local paths).
+    /// Other local-filesystem error (the upload/download local paths).
     LocalFile(String),
-    /// `InvalidPathError{fmt.Errorf(...)}` — many call sites, each with its own
-    /// message (main.go:119, helpers.go:120/143/152/166/181, …); carries the
+    /// Invalid path. Many call sites, each with its own message; carries the
     /// formatted text verbatim.
     InvalidPath(String),
-    /// `FileTransferError{fmt.Errorf("an error occured while …")}` (main.go:537,
-    /// helpers.go:555).
+    /// A file-transfer failure ("an error occured while …").
     FileTransfer(String),
-    /// `FileObjectError{error: err}` — wraps the underlying MTP op error
-    /// (GetObjectInfo, GetObjectHandles, GetObjectPropValue, DeleteObject,
-    /// SetObjectPropValue). Kept as the live `MtpError` (not flattened to a
-    /// string) so callers can inspect the response code — e.g. `FileExists`'
-    /// `RCError == 0x2009` test (main.go:186-193) via [`VfsError::rc_code`].
+    /// Wraps the underlying MTP op error (GetObjectInfo, GetObjectHandles,
+    /// GetObjectPropValue, DeleteObject, SetObjectPropValue). Kept as the live
+    /// `MtpError` (not flattened to a string) so callers can inspect the response
+    /// code — e.g. `file_exists`' `RC == 0x2009` test via [`VfsError::rc_code`].
     FileObject(MtpError),
-    /// `SendObjectError{error: err}` (helpers.go:221, 257, 270).
+    /// A SendObjectInfo / SendObject failure.
     SendObject(MtpError),
     /// Bare passthrough of an `MtpError` (contract `VfsError::Mtp`).
     Mtp(MtpError),
 
-    /// keel EXTENSION mirroring Go's `send_to_js.TransferCancelledError`
-    /// (ferry/kernel/send_to_js/errors.go:14-18). go-mtpx itself has no cancel
-    /// concept; the Go kernel bolted one on at the FFI layer (legacy kernel L356/372/
-    /// 454/470 poll an `atomic.Bool` inside the preprocess/progress callbacks and
-    /// return `TransferCancelledError` on a fire). keel moves that poll into the
-    /// transfer callbacks (`upload.rs` / `download.rs` take a `should_cancel`
-    /// closure) and raises this distinct variant instead of threading a
-    /// stringly-typed error up through `SendObjectError`/`FileTransferError`.
+    /// keel extension for transfer cancellation. The transfer callbacks
+    /// (`upload.rs` / `download.rs` take a `should_cancel` closure) poll for a
+    /// cancel request and raise this distinct variant instead of threading a
+    /// stringly-typed error up through `SendObject` / `FileTransfer`.
     ///
-    /// Display is byte-for-byte Go's `TransferCancelledError.Error()`,
-    /// `"transfer cancelled by user"`, so the FFI mapper's *substring* fallback
-    /// (send_to_js/helpers.go:15-17 — `strings.Contains(e.Error(), "transfer
-    /// cancelled by user")`) still fires even though keel-ffi will normally match
-    /// this variant by type → `ErrorTransferCancelled`. Carries no wrapped
+    /// Display is the frozen string `"transfer cancelled by user"`, so the FFI
+    /// mapper's *substring* fallback still fires even though keel-ffi normally
+    /// matches this variant by type → `ErrorTransferCancelled`. Carries no wrapped
     /// `MtpError`, so [`rc_code`](VfsError::rc_code) / `source` are `None`.
     Cancelled,
 }
@@ -105,11 +80,9 @@ pub enum VfsError {
 impl VfsError {
     /// If this error ultimately wraps a non-OK MTP response code, return it.
     ///
-    /// Load-bearing for go-mtpx `FileExists` (main.go:186-193): it sets
-    /// `Exists = false` when a `FileObjectError` wraps `mtp.RCError == 0x2009`
-    /// (RC_InvalidObjectHandle). Go read that numeric code straight off the
-    /// wrapped `mtp.RCError`; keel preserves the ability by carrying the live
-    /// `MtpError` in the op-wrapping variants and exposing the code here.
+    /// Load-bearing for `file_exists`: it sets `exists = false` when a `FileObject`
+    /// error wraps RC 0x2009 (RC_InvalidObjectHandle). The op-wrapping variants
+    /// carry the live `MtpError` so the numeric code stays inspectable here.
     pub fn rc_code(&self) -> Option<u16> {
         let mtp = match self {
             VfsError::Configure(e)
@@ -131,12 +104,11 @@ impl VfsError {
 impl fmt::Display for VfsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            // Go's embedded-error types render as the wrapped message.
+            // Wrapping variants render as their wrapped message.
             VfsError::MtpDetectFailed(s) => write!(f, "{s}"),
             VfsError::Configure(e) => write!(f, "{e}"),
             VfsError::DeviceInfo(e) => write!(f, "{e}"),
             VfsError::StorageInfo(e) => write!(f, "{e}"),
-            // main.go:63.
             VfsError::NoStorage => write!(f, "no storage found"),
             VfsError::ListDirectory(e) => write!(f, "{e}"),
             VfsError::FileNotFound(s) => write!(f, "{s}"),
@@ -147,12 +119,11 @@ impl fmt::Display for VfsError {
             VfsError::FileObject(e) => write!(f, "{e}"),
             VfsError::SendObject(e) => write!(f, "{e}"),
             VfsError::Mtp(e) => write!(f, "{e}"),
-            // send_to_js/errors.go:17 — verbatim so the FFI substring fallback fires.
+            // Verbatim so the FFI substring fallback fires.
             VfsError::Cancelled => write!(f, "transfer cancelled by user"),
             // keel extension. Mirrors keel-usb's DiscoverError::ExclusiveAccess
             // wording so the FFI can surface (and, with an owner, name) the
-            // blocking process. No go-mtpx string to match — this path never
-            // existed in Go.
+            // blocking process.
             VfsError::ExclusiveAccess { owner: Some(who) } => write!(
                 f,
                 "device is held exclusively by another process ({who}); quit it and try again"
@@ -188,20 +159,20 @@ mod tests {
 
     #[test]
     fn no_storage_message_matches_go() {
-        // main.go:63 — fmt.Errorf("no storage found").
+        // The exact "no storage found" message.
         assert_eq!(VfsError::NoStorage.to_string(), "no storage found");
     }
 
     #[test]
     fn file_object_preserves_rc_substring_for_ffi() {
-        // send_to_js/helpers.go substring-matches the bare RC name.
+        // The FFI substring-matches the bare RC name.
         let e = VfsError::FileObject(MtpError::Rc(RcError(RespCode::STORE_FULL)));
         assert!(e.to_string().contains("StoreFull"));
     }
 
     #[test]
     fn rc_code_exposes_wrapped_response_code() {
-        // FileExists' 0x2009 (RC_InvalidObjectHandle) check depends on this.
+        // `file_exists`' 0x2009 (RC_InvalidObjectHandle) check depends on this.
         let e = VfsError::FileObject(MtpError::Rc(RcError(RespCode(0x2009))));
         assert_eq!(e.rc_code(), Some(0x2009));
         // Message-only variants carry no code.

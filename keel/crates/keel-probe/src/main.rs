@@ -1,21 +1,17 @@
-//! keel-probe — the Rust twin of the Swift `legacy kernel-probe`
-//! (Sources/FerryProbe/Probe.swift). A dev harness that drives the keel kernel
-//! two ways:
+//! keel-probe — a dev harness that drives the keel MTP kernel two ways:
 //!
 //!   * DIRECT (default): calls `keel-vfs` in-process — no FFI, no JSON, fast
-//!     iteration. The path go-mtpx's `main.go` exports take.
-//!   * `--via-ffi`: `dlopen`s the built `libkeel.dylib` and drives the exact
-//!     the frozen C ABI (Initialize/Walk/UploadFiles/…), collecting every callback
-//!     payload and printing it (or dumping numbered `%04d.json` files EXACTLY
-//!     like the Swift `GoldenDump`, KeelFFI.swift:96-112).
+//!     iteration.
+//!   * `--via-ffi`: `dlopen`s the built `libkeel.dylib` and drives the frozen
+//!     C ABI (Initialize/Walk/UploadFiles/…), collecting every callback payload
+//!     and printing it (or dumping numbered `%04d.json` files).
 //!
-//! Subcommands (mirroring the Swift probe + the plan's keel-probe table,
-//! FERRY_RUST_KERNEL_PLAN.md §Crate 6):
+//! Subcommands:
 //!   info | storages | walk <path> [--recursive] | up <local> <remote> |
 //!   down <remote> <local> | rm <path> | mv <path> <newname> | mkdir <path> |
 //!   exists <path...> | golden | soak <local-tree>
 //!
-//! Argument parsing is hand-rolled (task: no clap, keep deps zero). Logging is
+//! Argument parsing is hand-rolled (no clap, zero deps). Logging is
 //! `env_logger` driven by `RUST_LOG`.
 
 use std::path::PathBuf;
@@ -30,7 +26,7 @@ pub struct Options {
     /// `--via-ffi`: drive the C ABI instead of keel-vfs directly.
     pub via_ffi: bool,
     /// `--dump-dir <dir>` (ffi mode): write each callback payload to
-    /// `<dir>/%04d.json`, matching Swift `GoldenDump`.
+    /// `<dir>/%04d.json`.
     pub dump_dir: Option<PathBuf>,
     /// `--lib <path>` (ffi mode): explicit `libkeel.dylib` path.
     pub lib: Option<PathBuf>,
@@ -101,7 +97,7 @@ fn fail_usage(msg: &str) -> ! {
 }
 
 fn main() {
-    // env_logger driven by RUST_LOG (task requirement).
+    // env_logger driven by RUST_LOG.
     env_logger::Builder::from_default_env()
         .format_timestamp_millis()
         .init();

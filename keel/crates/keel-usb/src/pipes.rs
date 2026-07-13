@@ -1,13 +1,11 @@
 //! `UsbTransport` — the bulk in/out/reset pipe layer implementing
 //! `keel_mtp::Transport` over nusb 0.2.4.
 //!
-//! Ports the pipe half of go-mtpfs `mtp/mtp.go`: `sendReq`/`bulkWrite` →
-//! `bulk_out`, `fetchPacket`/`bulkRead` → `bulk_in`, and `Device.Close`'s
-//! `d.h.Reset()` → `reset` (but as a SIC class reset, not a USB port reset —
-//! see `reset` below). Protocol-level framing (SeparateHeader, the XHCI
-//! response-in-place-of-ZLP inspection, transaction IDs) lives one layer up in
-//! keel-mtp; this file is purely per-pipe byte movement plus the two per-pipe
-//! quirks the plan assigns here: the ZLP delimiter and 16 KiB chunking.
+//! `bulk_out` writes, `bulk_in` reads, and `reset` issues a SIC class reset (not
+//! a USB port reset — see `reset` below). Protocol-level framing (SeparateHeader,
+//! the XHCI response-in-place-of-ZLP inspection, transaction IDs) lives one layer
+//! up in keel-mtp; this file is purely per-pipe byte movement plus the two
+//! per-pipe quirks it owns: the ZLP delimiter and 16 KiB chunking.
 
 use std::time::Duration;
 
@@ -21,21 +19,18 @@ use keel_mtp::{Transport, TransportError};
 
 use crate::handle::blocking;
 
-/// libusb's per-call ceiling, kept verbatim from go-mtpfs (`rwBufSize`,
-/// mtp.go:526: "The linux usb stack can send 16kb per call, according to
-/// libusb"). nusb/IOKit has no such limit — mtp-rs streams 256 KiB transfers —
-/// but the plan (`keel-usb pipes`) pins 16 KiB chunking as a faithful quirk, and
-/// it is harmless (just more `transfer_blocking` calls). The terminal ZLP is
-/// emitted once for the whole `bulk_out` call, never between chunks.
+/// Per-call chunk ceiling for bulk transfers. nusb/IOKit imposes no such limit,
+/// but 16 KiB chunking is a deliberately preserved quirk (some USB stacks accept
+/// only 16 KiB per call) and is harmless — just more `transfer_blocking` calls.
+/// The terminal ZLP is emitted once for the whole `bulk_out` call, never between
+/// chunks.
 const RW_BUF_SIZE: usize = 0x4000;
 
-/// SIC (USB Still Image Class) DEVICE_RESET request code (docs/nusb-api.md §5).
+/// SIC (USB Still Image Class) DEVICE_RESET request code.
 const SIC_DEVICE_RESET_REQUEST: u8 = 0x66;
 
 /// USB transport over one claimed MTP interface. Owns its three endpoints
-/// exclusively (`&mut self` everywhere), so — unlike mtp-rs, which wraps each
-/// endpoint in a `futures::lock::Mutex` for `Sync` — no locking is needed
-/// (docs/nusb-api.md §8).
+/// exclusively (`&mut self` everywhere), so no locking is needed.
 pub struct UsbTransport {
     // Held for lifetime/RAII: dropping `interface` releases it and dropping
     // `device` closes the handle. Kept as fields so `reset` can issue control
@@ -47,7 +42,7 @@ pub struct UsbTransport {
     bulk_in: Endpoint<Bulk, In>,
     bulk_out: Endpoint<Bulk, Out>,
     interrupt_in: Endpoint<Interrupt, In>,
-    /// Max packet size of the bulk-IN (fetch) endpoint — Go's `fetchMaxPacketSize`.
+    /// Max packet size of the bulk-IN (fetch) endpoint.
     in_mps: usize,
     /// Bytes from an IN completion that overflowed the caller's buffer, returned
     /// first on the next `bulk_in`. See `bulk_in` for why this can happen.
@@ -110,7 +105,7 @@ impl UsbTransport {
 
 /// Round `size` up to a non-zero multiple of `mps`. nusb requires IN transfer
 /// buffers to be a non-zero multiple of the endpoint's max packet size
-/// (`Endpoint::submit`); verbatim from docs/nusb-api.md / mtp-rs.
+/// (`Endpoint::submit`).
 fn align_to_packet_size(size: usize, mps: usize) -> usize {
     if mps == 0 {
         return size.max(1);
@@ -126,7 +121,7 @@ fn align_to_packet_size(size: usize, mps: usize) -> usize {
 }
 
 /// Map a nusb `TransferError` to a `TransportError`, clearing the endpoint halt
-/// on a stall so the pipe is usable again (docs/nusb-api.md §2).
+/// on a stall so the pipe is usable again.
 ///
 /// A stalled bulk endpoint stays wedged across process restarts until
 /// `clear_halt`; the transfer has already completed (with the stall) so the
@@ -140,8 +135,8 @@ fn map_transfer_error<E: BulkOrInterrupt, D: EndpointDirection>(
         // Cancelled — surface as the retryable Timeout.
         TransferError::Cancelled => TransportError::Timeout,
         // Device left the bus. TransportError::DeviceGone's Display carries
-        // "LIBUSB_ERROR_NO_DEVICE" (pre-written contract) so the FFI mapper keeps
-        // firing ErrorDeviceChanged exactly as the Go/libusb stack did.
+        // "LIBUSB_ERROR_NO_DEVICE" so the FFI mapper keeps firing
+        // ErrorDeviceChanged — required by the wire contract.
         TransferError::Disconnected => TransportError::DeviceGone,
         TransferError::Stall => {
             let _ = blocking(ep.clear_halt());
@@ -156,37 +151,33 @@ fn map_transfer_error<E: BulkOrInterrupt, D: EndpointDirection>(
 impl Transport for UsbTransport {
     /// Write one bulk-OUT transfer.
     ///
-    /// GATE RECONCILIATION (keel-mtp ↔ keel-usb ZLP ownership). The plan's crate
-    /// table nominally parks the ZLP in keel-usb "per-pipe", but the terminal-ZLP
-    /// *decision* (Go's `lastTransfer % packetSize == 0`, mtp.go:597-600) can only
-    /// be made by the streaming transaction layer: `Transport::bulk_out` takes a
-    /// `&[u8]`, not a `Read`, so a multi-GB data phase MUST be fed in chunks —
-    /// each `bulk_out` call is one USB transfer, NOT one complete MTP message.
-    /// A per-message ZLP here would therefore fire *between* data-phase chunks and
-    /// prematurely terminate the transfer (and double-emit for the all-in-first-
-    /// packet case). So keel-mtp owns the decision (transaction.rs `bulk_write`)
-    /// and signals a required ZLP by calling `bulk_out(&[])`; this impl turns that
-    /// empty write into exactly one wire zero-length packet — the seam the
-    /// transaction layer already documents ("keel-usb's Transport turns an empty
-    /// write into the wire ZLP").
+    /// The terminal-ZLP decision (whether the final message length is a multiple
+    /// of the packet size) belongs to the transaction layer, not here:
+    /// `Transport::bulk_out` takes a `&[u8]`, not a `Read`, so a multi-GB data
+    /// phase MUST be fed in chunks — each `bulk_out` call is one USB transfer, NOT
+    /// one complete MTP message. A per-message ZLP here would fire *between*
+    /// data-phase chunks and prematurely terminate the transfer (and double-emit
+    /// for the all-in-first-packet case). So keel-mtp owns the decision and signals
+    /// a required ZLP by calling `bulk_out(&[])`; this impl turns that empty write
+    /// into exactly one wire zero-length packet.
     fn bulk_out(&mut self, data: &[u8], timeout: Duration) -> Result<usize, TransportError> {
         if self.closed {
             return Err(TransportError::Io("transport is closed".into()));
         }
 
         // Empty write == keel-mtp's explicit terminal-ZLP request. Emit exactly
-        // one zero-length bulk transfer (`Buffer::new(0)` is a wire ZLP). Go
-        // discards its result (mtp.go:599), so we do too; the 250 ms deadline is
-        // the `timeout` keel-mtp passes on this call.
+        // one zero-length bulk transfer (`Buffer::new(0)` is a wire ZLP). Its
+        // result is discarded; the 250 ms deadline is the `timeout` keel-mtp passes
+        // on this call.
         if data.is_empty() {
             let _ = self.bulk_out.transfer_blocking(Buffer::new(0), timeout).status;
             return Ok(0);
         }
 
         // A non-empty logical write. keel-mtp already caps each call at 16 KiB,
-        // but keep the chunk loop (plan `keel-usb pipes`: 16 KiB chunking) so an
-        // oversized slice is still split into libusb-sized transfers. No ZLP is
-        // appended here — that is the transaction layer's call (see above).
+        // but keep the chunk loop so an oversized slice is still split into 16 KiB
+        // transfers. No ZLP is appended here — that is the transaction layer's call
+        // (see above).
         let mut offset = 0;
         while offset < data.len() {
             let end = (offset + RW_BUF_SIZE).min(data.len());
@@ -203,22 +194,18 @@ impl Transport for UsbTransport {
 
     /// Read one bulk-IN transfer into `buf`, returning the byte count.
     ///
-    /// Uses nusb 0.2.4's `wait_next_complete(timeout)`, which is the blocking
-    /// equivalent of the `select(next_complete, futures_timer::Delay)` race the
-    /// plan/docs describe against nusb 0.2.3: on timeout it returns `None`
+    /// Uses nusb's `wait_next_complete(timeout)`: on timeout it returns `None`
     /// **without cancelling** the transfer, so the in-flight data is not lost and
-    /// the next call resumes it via `pending() > 0`. This is the cancel-safe,
-    /// resume-on-pending behaviour the contract requires, realised as a single
-    /// blocking call because `Transport::bulk_in` is synchronous (see deviations
-    /// note to the gate).
+    /// the next call resumes it via `pending() > 0`. This cancel-safe,
+    /// resume-on-pending read is realised as a single blocking call because
+    /// `Transport::bulk_in` is synchronous.
     ///
     /// `residue`: if a resumed transfer completes with more bytes than the
     /// current `buf` can hold (possible when a large read timed out and left a
     /// big buffer pending, then a caller passes a smaller `buf`), the overflow is
     /// stashed and returned first on the next call. This never truncates device
-    /// data — the Go/libusb synchronous model couldn't leave a transfer pending,
-    /// so this guard has no Go analogue; it exists because we DON'T trust the
-    /// caller's buffer sizing to match the pending transfer's.
+    /// data; the guard exists because we DON'T trust the caller's buffer sizing to
+    /// match the pending transfer's.
     fn bulk_in(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError> {
         if self.closed {
             return Err(TransportError::Io("transport is closed".into()));
@@ -260,11 +247,9 @@ impl Transport for UsbTransport {
     /// Reset the device via the SIC (Still Image Class) DEVICE_RESET control
     /// request — NOT a USB port reset.
     ///
-    /// go-mtpfs's recovery paths call `d.h.Reset()` = `libusb_reset_device`, a
-    /// real port reset. docs/nusb-api.md §5 mandates the class reset instead: on
-    /// macOS a port reset re-enumerates the device (invalidating our handle),
-    /// whereas the SIC class reset returns the device to Idle in place. Sequence
-    /// mirrors mtp-rs's `reset_device`:
+    /// A USB port reset (`libusb_reset_device`-style) re-enumerates the device on
+    /// macOS and invalidates our handle; the SIC class reset instead returns the
+    /// device to Idle in place. Sequence:
     ///   1. DEVICE_RESET control transfer (bRequest 0x66, no payload).
     ///   2. Resync both bulk endpoints: cancel pending → `clear_halt` (the reset
     ///      cleared the device's data toggles).
@@ -296,7 +281,7 @@ impl Transport for UsbTransport {
         let _ = blocking(self.bulk_in.clear_halt());
 
         // Step 3: drain stale bulk-IN data until the pipe is idle (300 ms idle
-        // race, matching mtp-rs).
+        // race).
         loop {
             if self.bulk_in.pending() == 0 {
                 let size = align_to_packet_size(self.in_mps, self.in_mps);
@@ -315,7 +300,7 @@ impl Transport for UsbTransport {
         Ok(())
     }
 
-    /// Max packet size for framing decisions — Go's `fetchMaxPacketSize`.
+    /// Max packet size for framing decisions.
     /// keel-mtp's transaction layer compares the first data packet against this
     /// (SeparateHeader detection) and computes the terminal-ZLP condition from it.
     /// In/out mps are equal on every real MTP bulk pair.

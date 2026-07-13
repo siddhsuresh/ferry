@@ -1,15 +1,13 @@
 //! PTP/MTP datasets — explicit decode/encode, no reflection.
 //!
-//! Ported 1:1 from go-mtpfs `mtp/types.go` (struct shapes) and `mtp/encoding.go`
-//! (the `decodeWithSelector` / `encodeField` reflection engine that Go runs over
-//! those structs). Field names are the Go names, snake_cased; field *order* is
-//! load-bearing — it is the wire order the Go reflection walk produced.
+//! Struct shapes follow the PTP/MTP dataset layouts. Field *order* is
+//! load-bearing — it is the wire order — so decode/encode walk the fields in
+//! declaration order.
 //!
-//! Direction per dataset (which way the Go ops actually move it — see
-//! `mtp/ops.go`):
+//! Direction per dataset (which way the ops actually move it):
 //!   * DeviceInfo, StorageInfo         — decode only (GetDeviceInfo/GetStorageInfo)
 //!   * ObjectInfo                      — decode (GetObjectInfo) AND encode
-//!                                       (SendObjectInfo writes it, ops.go:184)
+//!                                       (SendObjectInfo writes it)
 //!   * DevicePropDesc, ObjectPropDesc  — decode only (GetObjectPropDesc etc.)
 //!   * Uint32Array/Uint16Array         — decode (GetStorageIDs/GetObjectHandles/
 //!                                       GetObjectPropsSupported)
@@ -20,19 +18,15 @@
 //! strings, PTP datetimes, count-prefixed arrays), so the "trust nothing"
 //! bounds checking lives in one place.
 //!
-//! Fidelity fixes applied here (plan §3.5, "internal bugs are fixed"):
-//!   * INT128/UINT128 values decode via a 16-byte little-endian read instead of
-//!     Go's `[16]byte` path, which panics (`encoding.go:273` default arm).
-//!   * Array-typed property values decode via a count-prefixed loop instead of
-//!     Go's `InstantiateType`, which panics on any array selector
-//!     (`encoding.go:404` default arm).
-//!   * DevicePropDesc/ObjectPropDesc enumeration form decodes instead of
-//!     panicking (Go's `decodeArray` over `[]interface{}` hits
-//!     `kindSize(Interface)` → panic, `encoding.go:98`).
+//! A few decode paths handle values that a reflection-based decoder would choke
+//! on; here they decode cleanly rather than panicking:
+//!   * INT128/UINT128 values decode via a 16-byte little-endian read.
+//!   * Array-typed property values decode via a count-prefixed loop.
+//!   * DevicePropDesc/ObjectPropDesc enumeration forms decode their values.
 //!
 //! None of these paths are FFI-observable in Ferry (prop descs / non-string,
-//! non-u64 prop values never reach the callback JSON), so fixing them cannot
-//! change parity — it only stops the crash.
+//! non-u64 prop values never reach the callback JSON), so handling them cannot
+//! change behavior — it only stops the crash.
 
 use std::time::SystemTime;
 
@@ -43,11 +37,10 @@ use crate::error::ProtoError;
 // ---------------------------------------------------------------------------
 // MTP data-type codes and form flags.
 //
-// These mirror go-mtpfs `mtp/const.go:742-754` (data type codes) and
-// `const.go:724-726` (form flags). They are public USB-IF PTP/MTP spec values
-// (facts, not expression). Kept as private literals here so the selector match
-// below does not couple to whatever naming `consts.rs` exposes; the gate agent
-// may dedupe against `consts::DataType` associated constants if it prefers.
+// These are the public USB-IF PTP/MTP spec values for data type codes and form
+// flags. Kept as private literals here so the selector match below does not
+// couple to whatever naming `consts.rs` exposes; they can be deduped against
+// `consts::DataType` associated constants later if preferred.
 // ---------------------------------------------------------------------------
 const DTC_INT8: u16 = 0x0001;
 const DTC_UINT8: u16 = 0x0002;
@@ -81,13 +74,13 @@ fn checked_need(count: usize, elem: usize, have: usize) -> Result<(), ProtoError
 }
 
 // ---------------------------------------------------------------------------
-// PropValue — the Rust form of Go's `DataDependentType` (`interface{}` decoded
-// via a `DataTypeSelector`). types.go:39-41.
+// PropValue — a single MTP data-dependent value, decoded via a data-type
+// selector.
 // ---------------------------------------------------------------------------
 
 /// A single MTP property value, tagged by the data-type selector that produced
 /// it. Covers every DTC_* scalar, the STR type, and every array (`ARRAY_MASK`)
-/// variant — the last two categories are the ones Go panicked on.
+/// variant.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PropValue {
     I8(i8),
@@ -114,9 +107,8 @@ pub enum PropValue {
 }
 
 impl PropValue {
-    /// Encode the raw value bytes (no type/length prefix), matching Go's
-    /// `Encode` over a value wrapper struct (`SendData`, ops.go:98) — arrays get
-    /// a uint32 count prefix, strings the PTP string encoding, scalars raw LE.
+    /// Encode the raw value bytes (no type/length prefix) — arrays get a uint32
+    /// count prefix, strings the PTP string encoding, scalars raw LE.
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             PropValue::I8(v) => codec::write_i8(*v, out),
@@ -184,8 +176,7 @@ impl PropValue {
     }
 }
 
-/// Decode one `DataDependentType` value given its selector — the fixed version
-/// of Go's `InstantiateType` + `decodeField` (encoding.go:230-409).
+/// Decode one data-dependent value given its selector.
 pub fn decode_prop_value(buf: &mut &[u8], selector: u16) -> Result<PropValue, ProtoError> {
     // STR (0xFFFF) has the ARRAY_MASK (0x4000) bit set, so it must be tested
     // before the array check or it would be misread as an array.
@@ -193,16 +184,14 @@ pub fn decode_prop_value(buf: &mut &[u8], selector: u16) -> Result<PropValue, Pr
         return Ok(PropValue::Str(codec::decode_string(buf)?));
     }
     if selector & DTC_ARRAY_MASK != 0 {
-        // Array value: uint32 count then N base-typed elements. FIX (plan §3.5):
-        // Go's InstantiateType panics on every array selector (encoding.go:404).
+        // Array value: uint32 count then N base-typed elements.
         let base = selector & !DTC_ARRAY_MASK;
         let count = codec::read_u32(buf)? as usize;
         return decode_array_value(buf, base, count);
     }
     Ok(match selector {
         DTC_INT8 => PropValue::I8(codec::read_i8(buf)?),
-        // NB: Go's InstantiateType reads UINT8 into an int8 (encoding.go:374) —
-        // a value-preserving-for-<128 internal bug; we decode it as unsigned.
+        // UINT8 decodes as an unsigned u8 (not sign-extended).
         DTC_UINT8 => PropValue::U8(codec::read_u8(buf)?),
         DTC_INT16 => PropValue::I16(codec::read_i16(buf)?),
         DTC_UINT16 => PropValue::U16(codec::read_u16(buf)?),
@@ -210,8 +199,7 @@ pub fn decode_prop_value(buf: &mut &[u8], selector: u16) -> Result<PropValue, Pr
         DTC_UINT32 => PropValue::U32(codec::read_u32(buf)?),
         DTC_INT64 => PropValue::I64(codec::read_i64(buf)?),
         DTC_UINT64 => PropValue::U64(codec::read_u64(buf)?),
-        // FIX (plan §3.5): Go decodes INT128/UINT128 into a [16]byte, then
-        // panics on `reflect.Array` (encoding.go:273). We read 16 LE bytes.
+        // INT128/UINT128 read as 16 little-endian bytes.
         DTC_INT128 => PropValue::I128(codec::read_i128(buf)?),
         DTC_UINT128 => PropValue::U128(codec::read_u128(buf)?),
         _ => return Err(ProtoError::Unsupported("unknown MTP data type code")),
@@ -305,24 +293,22 @@ fn decode_array_value(buf: &mut &[u8], base: u16, count: usize) -> Result<PropVa
     })
 }
 
-/// The FORM field of a property description. Go models this as an untyped
-/// `interface{}` (`DevicePropDesc.Form`, types.go:74) holding either a
-/// `*PropDescRangeForm`, a `*PropDescEnumForm`, or nil.
+/// The FORM field of a property description: either a range form, an
+/// enumeration form, or none.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PropForm {
     None,
-    /// FORM_Range (DPFF_Range, 0x01) — types.go:53-57.
+    /// FORM_Range (DPFF_Range, 0x01).
     Range {
         minimum: PropValue,
         maximum: PropValue,
         step: PropValue,
     },
-    /// FORM_Enum (DPFF_Enumeration, 0x02) — types.go:59-61.
+    /// FORM_Enum (DPFF_Enumeration, 0x02).
     Enum { values: Vec<PropValue> },
 }
 
-/// Decode the FORM field — the fixed version of `decodePropDescForm`
-/// (encoding.go:411-424).
+/// Decode the FORM field.
 fn decode_form(buf: &mut &[u8], selector: u16, form_flag: u8) -> Result<PropForm, ProtoError> {
     match form_flag {
         DPFF_RANGE => Ok(PropForm::Range {
@@ -332,11 +318,9 @@ fn decode_form(buf: &mut &[u8], selector: u16, form_flag: u8) -> Result<PropForm
         }),
         DPFF_ENUMERATION => {
             // The enum form is a UINT16 "Number of Values" count then that many
-            // selector-typed values (PTP/MTP spec). FIX (plan §3.5): Go decodes
-            // `Values []interface{}` through `decodeArray`, which panics at
-            // `kindSize(reflect.Interface)` (encoding.go:98) before reading
-            // anything. NB the width here is uint16 — distinct from the uint32
-            // count used by array-typed *values* above.
+            // selector-typed values (PTP/MTP spec). NB the count width here is
+            // uint16 — distinct from the uint32 count used by array-typed
+            // *values* above.
             let count = codec::read_u16(buf)? as usize;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
@@ -344,13 +328,13 @@ fn decode_form(buf: &mut &[u8], selector: u16, form_flag: u8) -> Result<PropForm
             }
             Ok(PropForm::Enum { values })
         }
-        // DPFF_None (0x00) or any unknown flag → no form data (encoding.go:422).
+        // DPFF_None (0x00) or any unknown flag → no form data.
         _ => Ok(PropForm::None),
     }
 }
 
 // ---------------------------------------------------------------------------
-// DeviceInfo — types.go:21-36. Decode only (GetDeviceInfo, ops.go:65).
+// DeviceInfo — decode only (GetDeviceInfo).
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -393,7 +377,7 @@ impl DeviceInfo {
 }
 
 // ---------------------------------------------------------------------------
-// StorageInfo — types.go:107-116. Decode only (GetStorageInfo, ops.go:145).
+// StorageInfo — decode only (GetStorageInfo).
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -422,24 +406,22 @@ impl StorageInfo {
         })
     }
 
-    /// types.go:118 — FST_GenericHierarchical (const.go:865).
+    /// FST_GenericHierarchical.
     pub fn is_hierarchical(&self) -> bool {
         self.filesystem_type == 0x0002
     }
-    /// types.go:122 — FST_DCF (const.go:866).
+    /// FST_DCF.
     pub fn is_dcf(&self) -> bool {
         self.filesystem_type == 0x0003
     }
-    /// types.go:126 — ST_RemovableROM (0x0002) || ST_RemovableRAM (0x0004),
-    /// const.go:1918/1920.
+    /// ST_RemovableROM (0x0002) || ST_RemovableRAM (0x0004).
     pub fn is_removable(&self) -> bool {
         self.storage_type == 0x0002 || self.storage_type == 0x0004
     }
 }
 
 // ---------------------------------------------------------------------------
-// ObjectInfo — types.go:131-151. Decode (GetObjectInfo) AND encode
-// (SendObjectInfo writes it, ops.go:184).
+// ObjectInfo — decode (GetObjectInfo) AND encode (SendObjectInfo writes it).
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -447,10 +429,10 @@ pub struct ObjectInfo {
     pub storage_id: u32,
     pub object_format: u16,
     pub protection_status: u16,
-    /// u32 on the wire (types.go:135). `0xFFFFFFFF` is the ">4 GiB" sentinel:
-    /// go-mtpx re-fetches the real size via OPC_ObjectSize when it sees this
-    /// value (helpers.go:20). Kept as u32 — widening it would break that check
-    /// and the encoded wire size.
+    /// u32 on the wire. `0xFFFFFFFF` is the ">4 GiB" sentinel: when the size
+    /// reads as this value, callers re-fetch the real size via OPC_ObjectSize.
+    /// Kept as u32 — widening it would break that check and the encoded wire
+    /// size.
     pub compressed_size: u32,
     pub thumb_format: u16,
     pub thumb_compressed_size: u32,
@@ -464,10 +446,9 @@ pub struct ObjectInfo {
     pub association_desc: u32,
     pub sequence_number: u32,
     pub filename: String,
-    /// `None` == Go's zero `time.Time` (encoded as an empty PTP string;
-    /// `encodeTime`/`decodeTime`, encoding.go:188-228). A concrete value —
-    /// including the Unix epoch — is `Some`, so the epoch is *not* treated as
-    /// absent (it would encode as "19700101T000000").
+    /// `None` is an unset time, encoded as an empty PTP string. A concrete
+    /// value — including the Unix epoch — is `Some`, so the epoch is *not*
+    /// treated as absent (it would encode as "19700101T000000").
     pub capture_date: Option<SystemTime>,
     pub modification_date: Option<SystemTime>,
     pub keywords: String,
@@ -522,8 +503,7 @@ impl ObjectInfo {
 }
 
 /// Decode a PTP-datetime field: read the PTP string, then parse it. An empty
-/// string maps to `None` (Go's `decodeTime` leaves the zero `time.Time` and
-/// only parses when the string is non-empty, encoding.go:210).
+/// string maps to `None`; only a non-empty string is parsed.
 fn decode_date_field(buf: &mut &[u8]) -> Result<Option<SystemTime>, ProtoError> {
     let s = codec::decode_string(buf)?;
     if s.is_empty() {
@@ -533,8 +513,8 @@ fn decode_date_field(buf: &mut &[u8]) -> Result<Option<SystemTime>, ProtoError> 
     }
 }
 
-/// Encode a PTP-datetime field: `None` → empty PTP string (Go writes "" for the
-/// zero time, encoding.go:191); `Some(t)` → the "YYYYMMDDThhmmss" encoding.
+/// Encode a PTP-datetime field: `None` → empty PTP string; `Some(t)` → the
+/// "YYYYMMDDThhmmss" encoding.
 fn encode_date_field(t: Option<SystemTime>, out: &mut Vec<u8>) {
     match t {
         None => codec::encode_string("", out),
@@ -543,8 +523,8 @@ fn encode_date_field(t: Option<SystemTime>, out: &mut Vec<u8>) {
 }
 
 // ---------------------------------------------------------------------------
-// DevicePropDesc — types.go:63-75 (DevicePropDescFixed + Form). Decode only.
-// `pd.Decode` in Go: decode the fixed part, then the form (encoding.go:435).
+// DevicePropDesc — fixed part + Form. Decode only: decode the fixed part, then
+// the form.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
@@ -561,8 +541,8 @@ pub struct DevicePropDesc {
 impl DevicePropDesc {
     pub fn decode(buf: &mut &[u8]) -> Result<Self, ProtoError> {
         let device_property_code = codec::read_u16(buf)?;
-        // The DataType field seeds the selector for the DataDependentType values
-        // that follow (`decodeWithSelector`, encoding.go:334).
+        // The DataType field seeds the selector for the data-dependent values
+        // that follow.
         let data_type = DataType(codec::read_u16(buf)?);
         let get_set = codec::read_u8(buf)?;
         let factory_default_value = decode_prop_value(buf, data_type.0)?;
@@ -582,8 +562,8 @@ impl DevicePropDesc {
 }
 
 // ---------------------------------------------------------------------------
-// ObjectPropDesc — types.go:77-89. Like DevicePropDesc but with a single
-// DataDependentType value and a GroupCode (u32) in place of CurrentValue.
+// ObjectPropDesc — like DevicePropDesc but with a single data-dependent value
+// and a GroupCode (u32) in place of CurrentValue.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
@@ -619,13 +599,13 @@ impl ObjectPropDesc {
 }
 
 // ---------------------------------------------------------------------------
-// Thin value wrappers — types.go:91-105. These are the concrete decode/encode
-// targets go-mtpx hands to GetObjectPropValue / SetObjectPropValue / the ID
-// ops, so the caller (keel-mtp) picks the type from the property it queried
-// rather than from a datatype selector.
+// Thin value wrappers — the concrete decode/encode targets for
+// GetObjectPropValue / SetObjectPropValue / the ID ops, so the caller
+// (keel-mtp) picks the type from the property it queried rather than from a
+// datatype selector.
 // ---------------------------------------------------------------------------
 
-/// GetStorageIDs / GetObjectHandles target (Uint32Array, types.go:91).
+/// GetStorageIDs / GetObjectHandles target (Uint32Array).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Uint32Array {
     pub values: Vec<u32>,
@@ -639,7 +619,7 @@ impl Uint32Array {
     }
 }
 
-/// GetObjectPropsSupported target (Uint16Array, types.go:95).
+/// GetObjectPropsSupported target (Uint16Array).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Uint16Array {
     pub values: Vec<u16>,
@@ -653,8 +633,7 @@ impl Uint16Array {
     }
 }
 
-/// GetObjectPropValue(OPC_ObjectSize) target (Uint64Value, types.go:99;
-/// go-mtpx helpers.go:21).
+/// GetObjectPropValue(OPC_ObjectSize) target (Uint64Value).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Uint64Value {
     pub value: u64,
@@ -671,9 +650,8 @@ impl Uint64Value {
     }
 }
 
-/// GetObjectPropValue(OPC_ObjectFileName) target and the value SetObjectPropValue
-/// writes on rename (StringValue, types.go:103; go-mtpx helpers.go:91,
-/// main.go:252).
+/// GetObjectPropValue(OPC_ObjectFileName) target and the value
+/// SetObjectPropValue writes on rename (StringValue).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StringValue {
     pub value: String,
@@ -696,8 +674,8 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     /// Little-endian bytes of a PTP string: 1-byte count (code units incl. the
-    /// trailing NUL) then UTF-16LE + the NUL unit. Matches `encodeStr`
-    /// (encoding.go:46). ASCII-only, sufficient for these golden vectors.
+    /// trailing NUL) then UTF-16LE + the NUL unit. ASCII-only, sufficient for
+    /// these golden vectors.
     fn ptp_str(s: &str) -> Vec<u8> {
         if s.is_empty() {
             return vec![0x00];
@@ -790,7 +768,7 @@ mod tests {
     fn object_info_roundtrip_no_dates() {
         let oi = ObjectInfo {
             storage_id: 0x00010001,
-            object_format: 0x3000, // Undefined — what go-mtpx uploads use
+            object_format: 0x3000, // Undefined — used for uploads
             protection_status: 0,
             compressed_size: 0xFFFFFFFF, // >4 GiB sentinel
             thumb_format: 0,
@@ -871,7 +849,7 @@ mod tests {
         assert!(matches!(err, ProtoError::Truncated { .. }));
     }
 
-    // --- PropValue: the paths Go panics on (plan §3.5 fixes) --------------
+    // --- PropValue: 128-bit and array paths ------------------------------
 
     #[test]
     fn prop_value_uint128_decodes() {

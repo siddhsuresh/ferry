@@ -1,10 +1,14 @@
 # Ferry
 
-Ferry is a small, native macOS app for copying files between an Android phone
-and a Mac over USB MTP (Android's “File transfer” mode). It is primarily made for my personal usage
+⛴️ Ferry is a small, native macOS app for copying files between an Android
+phone and a Mac over USB MTP (Android's “File transfer” mode). It's primarily
+built for my own use.
 
-Ferry copies files; it does not delete the source files or implement a
-destructive “move” operation.
+The MTP/PTP protocol runs on **keel**, a
+from-scratch, pure-Rust kernel with no libusb and no C dependencies — USB goes
+straight through [nusb](https://github.com/kevinmehall/nusb) over IOKit. The
+interface is SwiftUI with Liquid Glass. Ferry *copies* files; it never deletes
+the source or performs a destructive “move”.
 
 ## Requirements
 
@@ -90,12 +94,13 @@ app location or the architecture-specific `Libraries/` directory.
 ## Project layout
 
 ```text
-Sources/FerryApp/   macOS application entry point
-Sources/FerryUI/    SwiftUI views and the device-facing session state machine
-Sources/KeelKit/    Swift async facade and C ABI bridge
-keel/               Rust MTP/PTP kernel and its tests
-Libraries/          locally built architecture-specific kernel dylibs
-scripts/            kernel, app, icon, and DMG build helpers
+Sources/FerryApp/    macOS application entry point
+Sources/FerryUI/     SwiftUI views and the device-facing session state machine
+Sources/KeelKit/     Swift async facade and C ABI bridge
+Sources/FerryProbe/  command-line harness for diagnosing a connected phone
+keel/                Rust MTP/PTP kernel (7 crates) and its tests
+Libraries/           architecture-specific kernel dylibs (checked in for convenience)
+scripts/             kernel, app, icon, and DMG build helpers
 ```
 
 The runtime path is:
@@ -119,8 +124,10 @@ their file count.
 - Android device behavior varies by vendor and USB mode.
 - “Skip files that already exist” currently applies to top-level downloads;
   files inside downloaded folders are handled by the kernel as a batch.
-- The app does not provide encryption beyond the USB/MTP connection and has no
-  server or cloud component.
+- Ferry transfers files locally over USB using Android's MTP interface. It has no
+  server or cloud component and does not add application-level encryption.
+  Security relies on USB authorization and the storage protections provided by
+  Android and macOS.
 
 ## License and notices
 

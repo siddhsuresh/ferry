@@ -1,11 +1,9 @@
 //! Shared helpers for both probe modes (direct keel-vfs and `--via-ffi`).
 //!
-//! Zero external deps by design (the crate keeps `rand` etc. out of its
-//! dependency set, per the task): the PRNG is a hand-rolled xorshift, the
+//! Zero external deps by design: the PRNG is a hand-rolled xorshift, the
 //! byte-size formatter is ad-hoc, and the golden source tree is built with
-//! `std::fs`. The golden tree mirrors the Swift `Probe.runGoldenSession` fixture
-//! (Sources/FerryProbe/Probe.swift:177-188) byte-for-byte so a Rust golden run
-//! reproduces the same device-side layout the Go-kernel capture used.
+//! `std::fs`. The golden tree has a fixed byte layout so a golden run always
+//! reproduces the same device-side layout for capture comparison.
 
 use std::cell::Cell;
 use std::fs;
@@ -13,8 +11,8 @@ use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A tiny xorshift64* PRNG. No `rand` dependency (task: keep deps zero); the
-/// soak cancel-injection only needs cheap, non-cryptographic randomness.
+/// A tiny xorshift64* PRNG. No `rand` dependency; the soak cancel-injection only
+/// needs cheap, non-cryptographic randomness.
 pub struct Rng(u64);
 
 impl Rng {
@@ -50,11 +48,11 @@ impl Default for Rng {
 }
 
 /// A cancel trigger for the soak torture test. Implements the `should_cancel`
-/// seam keel-vfs's `upload_files`/`download_files` poll (`&dyn Fn() -> bool`):
-/// it fires (returns `true`) once the callback has been polled `fire_at` times.
+/// seam that keel-vfs's `upload_files`/`download_files` poll
+/// (`&dyn Fn() -> bool`): it fires (returns `true`) once it has been polled
+/// `fire_at` times.
 ///
-/// Uses `Cell` interior mutability because the vfs seam is `Fn`, not `FnMut`
-/// (upload.rs:104 / download.rs:111 take `should_cancel: &dyn Fn() -> bool`).
+/// Uses `Cell` interior mutability because the seam is `Fn`, not `FnMut`.
 pub struct CancelInjector {
     count: Cell<u64>,
     fire_at: Option<u64>,
@@ -104,8 +102,8 @@ pub fn maybe_cancel_ms(rng: &mut Rng) -> Option<u64> {
     }
 }
 
-/// Human-readable byte count (base-1000, matching Swift's `.file` ByteCount
-/// style closely enough for a dev tool — not load-bearing for parity).
+/// Human-readable byte count (base-1000, close enough for a dev tool — not
+/// load-bearing).
 pub fn human_bytes(n: i64) -> String {
     if n < 0 {
         return "?".to_string();
@@ -124,26 +122,25 @@ pub fn human_bytes(n: i64) -> String {
     format!("{:.2} {}", v, UNITS[i])
 }
 
-/// Build the golden upload source tree — a faithful port of the Swift capture
-/// (Probe.swift:177-188): a 1.5 MB 0xA5 blob, a UTF-8 note with an emoji in both
-/// its name and body (exercises the UCS-2→UTF-16 surrogate fix), and a 300 KB
-/// 0x5A blob one level down under `sub/`.
+/// Build the golden upload source tree: a 1.5 MB 0xA5 blob, a UTF-8 note with an
+/// emoji in both its name and body (exercises the UTF-16 surrogate handling), and
+/// a 300 KB 0x5A blob one level down under `sub/`.
 pub fn create_golden_src_tree(local: &Path) -> io::Result<()> {
     let sub = local.join("sub");
     fs::create_dir_all(&sub)?;
-    // Probe.swift:182 — Data(repeating: 0xA5, count: 1_500_000).
+    // 1.5 MB 0xA5 blob.
     fs::write(local.join("blob-1.5mb.bin"), vec![0xA5u8; 1_500_000])?;
-    // Probe.swift:184 — the emoji filename + body.
+    // Emoji filename + body.
     fs::write(
         local.join("note-🛳️.txt"),
         "hello from keel golden capture — émoji: 🛳️\n".as_bytes(),
     )?;
-    // Probe.swift:186 — Data(repeating: 0x5A, count: 300_000) under sub/.
+    // 300 KB 0x5A blob under sub/.
     fs::write(sub.join("nested.bin"), vec![0x5Au8; 300_000])?;
     Ok(())
 }
 
-/// The base name of a path (Go `filepath.Base` for the soak remote staging dir).
+/// The final path component (used for the soak remote staging dir).
 pub fn base_name(p: &str) -> String {
     Path::new(p)
         .file_name()

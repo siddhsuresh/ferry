@@ -1,16 +1,15 @@
-//! `FileInfo` — the go-mtpx object model — plus the `ObjectInfo` → `FileInfo`
+//! `FileInfo` — the resolved object model — plus the `ObjectInfo` → `FileInfo`
 //! construction and the size / extension rules.
 //!
-//! Ports go-mtpx `structs.go` (`FileInfo`), `utils.go` (`extension`), and the
-//! `helpers.go` object helpers `GetFileSize` (14-34), `isObjectADir` (204-206),
-//! and `GetObjectFromObjectId` (38-78). The path-normalization helpers those
-//! depend on (`fixSlash`, `getFullPath`) live in `path.rs`.
+//! Holds [`FileInfo`], the [`extension`] rule, and the object helpers
+//! [`get_file_size`], [`is_object_a_dir`], and [`from_object_id`]. The
+//! path-normalization helpers those depend on (`fix_slash`, `get_full_path`) live
+//! in `path.rs`.
 //!
 //! Generic over the [`Transport`] so the same code drives the real
 //! `UsbTransport` and the test `FakeDevice` — matching the rest of keel-vfs
 //! (`path.rs` / `walk.rs` / `dirops.rs`); only `device.rs` names the concrete USB
-//! type. The sibling `walk` module calls [`from_object_id`] directly
-//! (walk.rs:118, 131).
+//! type. The sibling `walk` module calls [`from_object_id`] directly.
 
 use std::time::SystemTime;
 
@@ -36,28 +35,26 @@ pub fn thumbnail<T: Transport>(
 }
 use crate::path::{PARENT_OBJECT_ID, fix_slash, get_full_path};
 
-/// go-mtpfs `OFC_Association` (const.go:1237). An object with this format code is
-/// a directory (association); everything else is a file.
+/// The MTP `OFC_Association` format code. An object with this format code is a
+/// directory (association); everything else is a file.
 pub const OFC_ASSOCIATION: u16 = 0x3001;
 
-/// go-mtpx `allowedSecondExtensions` (const.go:20) = `map[string]string{"tar":
-/// "tar"}`. The single registered two-part extension is `tar`, which is what
-/// produces the `archive.tar.gz` → `"tar.gz"` result (utils.go:31-36).
+/// The single registered two-part extension is `tar`, which produces the
+/// `archive.tar.gz` → `"tar.gz"` result.
 const ALLOWED_SECOND_EXTENSIONS: &[&str] = &["tar"];
 
 fn is_allowed_second_extension(s: &str) -> bool {
     ALLOWED_SECOND_EXTENSIONS.contains(&s)
 }
 
-/// go-mtpx `FileInfo` (structs.go:20-32) — an object's resolved metadata.
+/// An object's resolved metadata.
 ///
-/// Field set is 1:1 with Go. Two mappings worth naming:
+/// Two field mappings worth naming:
 ///   * `mod_time` is `Option<SystemTime>` because it is sourced from
 ///     `ObjectInfo.modification_date`, which keel-proto models as
-///     `Option<SystemTime>` (`None` == Go's zero `time.Time`). Go's field is a
-///     plain `time.Time`; `None` here is that zero value.
-///   * `info` owns an `ObjectInfo` (Go held `*mtp.ObjectInfo`); the root
-///     shortcut uses `ObjectInfo::default()`, matching Go's `&mtp.ObjectInfo{}`.
+///     `Option<SystemTime>`; `None` is the zero/absent timestamp.
+///   * `info` owns an `ObjectInfo`; the root shortcut uses
+///     `ObjectInfo::default()`.
 #[derive(Clone, Debug, Default)]
 pub struct FileInfo {
     pub size: i64,
@@ -73,12 +70,12 @@ pub struct FileInfo {
     pub info: ObjectInfo,
 }
 
-/// go-mtpx `isObjectADir` (helpers.go:204-206): format code == OFC_Association.
+/// A directory is an object whose format code is `OFC_Association`.
 pub fn is_object_a_dir(obj: &ObjectInfo) -> bool {
     obj.object_format == OFC_ASSOCIATION
 }
 
-/// go-mtpx `extension` (utils.go:15-45).
+/// Compute a file's extension.
 ///
 /// Directories have no extension. Otherwise take the base name, split on `.`,
 /// and:
@@ -91,8 +88,8 @@ pub fn extension(filename: &str, is_dir: bool) -> String {
         return String::new();
     }
 
-    // Go: `filepath.Split(filename)` → the base name after the last separator.
-    // Filenames rarely contain a slash, but honor the split faithfully.
+    // Take the base name after the last separator. Filenames rarely contain a
+    // slash, but honor the split anyway.
     let base = match filename.rsplit_once('/') {
         Some((_, f)) => f,
         None => filename,
@@ -101,13 +98,12 @@ pub fn extension(filename: &str, is_dir: bool) -> String {
     let f: Vec<&str> = base.split('.').collect();
     let length = f.len();
 
-    // Go guards `length < 1` (utils.go:27) — unreachable since `split` yields at
-    // least one element, but preserved for fidelity.
+    // Unreachable since `split` yields at least one element, but guarded anyway.
     if length == 0 {
         return String::new();
     }
 
-    // Two-part special case (utils.go:31-36): the `foo.tar.gz` → "tar.gz" rule.
+    // Two-part special case: the `foo.tar.gz` → "tar.gz" rule.
     if length > 2 && is_allowed_second_extension(f[length - 2]) {
         return format!("{}.{}", f[length - 2], f[length - 1]);
     }
@@ -119,9 +115,9 @@ pub fn extension(filename: &str, is_dir: bool) -> String {
     String::new()
 }
 
-/// go-mtpx `GetFileSize` (helpers.go:14-34).
+/// Resolve an object's size.
 ///
-/// Directories are size 0. For files, the `ObjectInfo.CompressedSize` u32 is the
+/// Directories are size 0. For files, the `ObjectInfo.compressed_size` u32 is the
 /// size unless it is the `0xFFFFFFFF` ">4 GiB" sentinel, in which case the true
 /// 64-bit size is fetched via `OPC_ObjectSize`.
 pub fn get_file_size<T: Transport>(
@@ -138,15 +134,13 @@ pub fn get_file_size<T: Transport>(
         let val = session
             .object_prop_value(object_id, ObjectPropCode::OBJECT_SIZE)
             .map_err(VfsError::FileObject)?;
-        // Deviation from helpers.go:23-25: Go wraps the failure with a
-        // "GetObjectPropValue handle %d failed: %v" prefix. keel wraps the raw
-        // MtpError so `rc_code()` can still inspect it; the RC-name substring the
-        // FFI keys on is preserved, only the cosmetic prefix is dropped.
+        // Wrap the raw MtpError so `rc_code()` can still inspect it; the RC-name
+        // substring the FFI keys on is preserved.
         match val {
             PropValue::U64(v) => Ok(v as i64),
             // OPC_ObjectSize is a fixed UINT64 property, so object_prop_value
             // always yields U64 here (or a Proto error caught by `?`). Guard
-            // defensively rather than panic (never unwrap on device input).
+            // defensively rather than panic — never unwrap on device input.
             _ => Err(VfsError::FileObject(MtpError::Proto(
                 ProtoError::Unsupported("OPC_ObjectSize: expected UINT64 value"),
             ))),
@@ -156,16 +150,15 @@ pub fn get_file_size<T: Transport>(
     }
 }
 
-/// go-mtpx `GetObjectFromObjectId` (helpers.go:38-78) — build a [`FileInfo`] from
-/// a handle. `parent_path` is threaded through only to compute `full_path`; the
-/// helper's own doc-comment warns it "may not be valid" when the caller lacks the
-/// real parent path.
+/// Build a [`FileInfo`] from a handle. `parent_path` is threaded through only to
+/// compute `full_path`; that `full_path` may be inaccurate when the caller lacks
+/// the real parent path.
 pub fn from_object_id<T: Transport>(
     session: &mut MtpSession<T>,
     object_id: u32,
     parent_path: &str,
 ) -> Result<FileInfo, VfsError> {
-    // Root shortcut (helpers.go:42-50): the root parent has no ObjectInfo.
+    // Root shortcut: the root parent has no ObjectInfo.
     if object_id == PARENT_OBJECT_ID {
         return Ok(FileInfo {
             size: 0,
@@ -186,10 +179,8 @@ pub fn from_object_id<T: Transport>(
         .map_err(VfsError::FileObject)?;
     let is_dir = is_object_a_dir(&obj);
 
-    // Deviation from helpers.go:57-60: Go re-wraps GetFileSize's error in another
-    // FileObjectError (double-wrap). `get_file_size` already returns
-    // VfsError::FileObject, so keel propagates it directly — behaviourally
-    // identical (still FileObject-classified, same RC substring).
+    // `get_file_size` already returns VfsError::FileObject, so propagate it
+    // directly rather than re-wrapping.
     let size = get_file_size(session, &obj, object_id, is_dir)?;
 
     let parent_path = fix_slash(parent_path);
@@ -232,7 +223,7 @@ mod tests {
 
     #[test]
     fn extension_tar_gz_two_part_special_case() {
-        // utils.go:31-36 — the only registered second extension is "tar".
+        // The only registered second extension is "tar".
         assert_eq!(extension("archive.tar.gz", false), "tar.gz");
         assert_eq!(extension("backup.tar.bz2", false), "tar.bz2");
         // A non-"tar" second segment falls through to the single-extension rule.

@@ -1,4 +1,4 @@
-//! keel-vfs — path-level operations, go-mtpx parity (main.go export-for-export).
+//! keel-vfs — path-level MTP/PTP filesystem operations.
 pub mod device;
 pub mod dirops;
 pub mod download;

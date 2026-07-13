@@ -1,25 +1,11 @@
 //! keel-mtp error taxonomy.
 //!
-//! Ported from go-mtpfs `mtp/mtp.go` — the `RCError` type (lines 70-79), the
-//! `SyncError` type (lines 363-369), and the poisoning rule inside
-//! `RunTransaction` (lines 381-397):
-//!
-//! ```go
-//! if err := d.runTransaction(...); err != nil {
-//!     _, ok2 := err.(SyncError)   // lost protocol synchronization
-//!     _, ok1 := err.(usb.Error)   // any libusb error (BUSY/IO/ACCESS/TIMEOUT/…)
-//!     if ok1 || ok2 {
-//!         log.Printf("fatal error %v; closing connection.", err)
-//!         d.Close()               // <- poisons: subsequent ops see d.h == nil
-//!     }
-//!     return err
-//! }
-//! ```
-//!
-//! So exactly two error classes are *fatal* (they close/poison the connection):
-//! [`MtpError::Sync`] (Go's `SyncError`) and [`MtpError::Transport`] (Go's
-//! `usb.Error`). `RCError`, decode failures, and the "device is not open" guard
-//! do **not** poison — see [`MtpError::poisons`].
+//! Exactly two error classes are *fatal* — they close and poison the connection,
+//! so every later op fails fast: [`MtpError::Sync`] (lost protocol
+//! synchronization) and [`MtpError::Transport`] (any USB-level failure). When a
+//! transaction returns either, the connection is closed and subsequent ops see a
+//! dead handle. Response codes, decode failures, and the "device is not open"
+//! guard do **not** poison — see [`MtpError::poisons`].
 
 use std::fmt;
 
@@ -33,42 +19,38 @@ use crate::transport::TransportError;
 /// `enum MtpError { Rc, Sync, Transport, Proto, Closed }`.
 #[derive(Debug)]
 pub enum MtpError {
-    /// A non-OK MTP response code (Go `RCError`, mtp.go:359). Does **not**
-    /// poison. `Display` is the bare `RC_names` value (`"StoreFull"`, …) — the
-    /// FFI error mapper substring-matches it (`send_to_js/helpers.go:112,115`),
-    /// so it is load-bearing; the exactness lives in `keel_proto::RcError`.
+    /// A non-OK MTP response code. Does **not** poison. `Display` is the bare
+    /// response-code name (`"StoreFull"`, …) — the FFI error mapper
+    /// substring-matches it, so it is load-bearing; the exact spelling lives in
+    /// `keel_proto::RcError`.
     Rc(RcError),
 
-    /// Lost protocol synchronization (Go `SyncError`, mtp.go:363). **Poisons**
-    /// the session: the connection is closed and every later op returns
-    /// [`MtpError::Closed`]. Raised on: response container with the wrong
-    /// `Type`, a transaction-ID mismatch, or data arriving for an op that
-    /// expects none (mtp.go:341/498/505).
+    /// Lost protocol synchronization. **Poisons** the session: the connection is
+    /// closed and every later op returns [`MtpError::Closed`]. Raised on a
+    /// response container with the wrong `Type`, a transaction-ID mismatch, or
+    /// data arriving for an op that expects none.
     Sync(String),
 
-    /// A USB transport failure (Go `usb.Error`). **Poisons** the session, just
-    /// like libusb BUSY/IO/ACCESS/TIMEOUT did in Go. `TransportError::DeviceGone`
-    /// carries the `"LIBUSB_ERROR_NO_DEVICE"` marker the FFI mapper keys on.
+    /// A USB transport failure (BUSY/IO/ACCESS/TIMEOUT, …). **Poisons** the
+    /// session. `TransportError::DeviceGone` carries the
+    /// `"LIBUSB_ERROR_NO_DEVICE"` marker the FFI mapper keys on.
     Transport(TransportError),
 
-    /// A wire decode/encode failure from `keel-proto`. Does **not** poison —
-    /// mirrors Go returning a plain `fmt.Errorf`/`io.EOF` (e.g. the
-    /// "header specified 0x%x bytes, but have 0x%x" path, mtp.go:349), which is
-    /// neither a `SyncError` nor a `usb.Error`.
+    /// A wire decode/encode failure from `keel-proto`. Does **not** poison — a
+    /// malformed dataset (e.g. a header that claims more bytes than actually
+    /// arrived) is neither a sync loss nor a transport failure.
     Proto(ProtoError),
 
-    /// The session is already closed/poisoned. Corresponds to Go's
-    /// `RunTransaction` guard `if d.h == nil { return fmt.Errorf("mtp: cannot
-    /// run operation %v, device is not open", …) }` (mtp.go:383-385). Does not
-    /// poison (already closed). `Display` keeps the `"device is not open"`
-    /// substring the FFI mapper overrides on (plan keel-ffi/errors).
+    /// The session is already closed/poisoned. Every operation checks this guard
+    /// before touching the transport and bails out here. Does not poison (already
+    /// closed). `Display` keeps the `"device is not open"` substring the FFI
+    /// mapper overrides on.
     Closed,
 }
 
 impl MtpError {
-    /// Whether this error is *fatal* and must close/poison the connection —
-    /// the `ok1 || ok2` test in `RunTransaction` (mtp.go:389-390): only
-    /// `SyncError` and `usb.Error` qualify.
+    /// Whether this error is *fatal* and must close/poison the connection: only
+    /// sync losses and transport failures qualify.
     pub(crate) fn poisons(&self) -> bool {
         matches!(self, MtpError::Sync(_) | MtpError::Transport(_))
     }
@@ -81,9 +63,8 @@ impl fmt::Display for MtpError {
             MtpError::Sync(s) => write!(f, "{s}"),
             MtpError::Transport(e) => write!(f, "{e}"),
             MtpError::Proto(e) => write!(f, "{e}"),
-            // Go: "mtp: cannot run operation %v, device is not open" (mtp.go:384).
-            // We drop the interpolated op name (Closed is a unit variant per the
-            // contract); the load-bearing substring "device is not open" stays.
+            // Closed is a unit variant, so there is no op name to interpolate;
+            // the load-bearing substring "device is not open" stays.
             MtpError::Closed => write!(f, "mtp: cannot run operation, device is not open"),
         }
     }
@@ -145,7 +126,7 @@ mod tests {
 
     #[test]
     fn rc_display_is_bare_name_for_ffi_match() {
-        // Load-bearing for send_to_js/helpers.go:112,115.
+        // Load-bearing for the FFI error mapper's substring match.
         assert!(MtpError::Rc(RcError(RespCode::STORE_FULL))
             .to_string()
             .contains("StoreFull"));

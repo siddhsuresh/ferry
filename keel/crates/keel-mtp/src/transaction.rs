@@ -3,20 +3,19 @@
 //! machine, the XHCI response-in-place-of-ZLP tolerance, and 16 KiB chunk
 //! streaming with progress callbacks.
 //!
-//! Port of go-mtpfs `mtp/mtp.go`:
-//!   * `RunTransaction`  (381-397)  → [`MtpSession::run_transaction`]  (the
-//!     wrapper that poisons the connection on fatal errors)
-//!   * `runTransaction`  (401-510)  → [`MtpSession::run_transaction_raw`]
-//!   * `sendReq`         (291-318)  → [`MtpSession::send_req`]
-//!   * `fetchPacket`     (322-337)  → [`MtpSession::fetch_packet`]
-//!   * `decodeRep`       (339-361)  → [`decode_rep`]
-//!   * `bulkWrite`       (529-603)  → [`MtpSession::bulk_write`]
-//!   * `bulkRead`        (605-657)  → [`MtpSession::bulk_read`]
+//! The pieces:
+//!   * [`MtpSession::run_transaction`] — the wrapper that poisons the
+//!     connection on fatal errors
+//!   * [`MtpSession::run_transaction_raw`] — the actual work, no sanity checks
+//!   * [`MtpSession::send_req`] — encode and write the command
+//!   * [`MtpSession::fetch_packet`] — read one packet and split off the header
+//!   * [`decode_rep`] — validate and parse the response
+//!   * [`MtpSession::bulk_write`] — stream the data-out phase
+//!   * [`MtpSession::bulk_read`] — stream the data-in phase
 //!
 //! Progress: the transaction-level callback is `FnMut(u64) -> Result<(),
-//! MtpError>` (Go's `ProgressFunc func(sent int64) error`, types.go:170). The
-//! ops layer wraps it to add the object handle the contract's `FnMut(u64, u32)`
-//! shape wants.
+//! MtpError>` (bytes transferred). The ops layer wraps it to add the object
+//! handle the contract's `FnMut(u64, u32)` shape wants.
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -27,25 +26,23 @@ use crate::error::MtpError;
 use crate::session::MtpSession;
 use crate::transport::Transport;
 
-/// "The linux usb stack can send 16kb per call, according to libusb."
-/// go-mtpfs `rwBufSize` (mtp.go:526).
+/// The Linux USB stack can send 16 KiB per call, per libusb — the chunk size
+/// for streaming reads and writes.
 const RW_BUF_SIZE: usize = 0x4000;
 
-/// Timeout for the terminal short/zero-length packet — go-mtpfs writes it with a
-/// hard 250 ms deadline regardless of the session timeout (mtp.go:599).
+/// Timeout for the terminal short/zero-length packet — a hard 250 ms deadline
+/// regardless of the session timeout.
 const ZLP_TIMEOUT: Duration = Duration::from_millis(250);
 
 impl<T: Transport> MtpSession<T> {
-    /// `RunTransaction` (mtp.go:381-397): the guarded, connection-poisoning
-    /// wrapper the ops layer calls. Returns [`MtpError::Closed`] up front if the
-    /// session is already dead (Go's `if d.h == nil { … "device is not open" }`,
-    /// mtp.go:383-385), then runs the raw transaction and, on a *fatal* error
-    /// (`SyncError`/`usb.Error` — see [`MtpError::poisons`]), closes the
-    /// connection so every later op fails fast.
+    /// The guarded, connection-poisoning wrapper the ops layer calls. Returns
+    /// [`MtpError::Closed`] up front if the session is already dead, then runs
+    /// the raw transaction and, on a *fatal* error (see [`MtpError::poisons`]),
+    /// closes the connection so every later op fails fast.
     ///
-    /// `req` is consumed and the decoded response [`Container`] is returned (Go's
-    /// out-parameter `rep`); `dest` is the device→host data-in sink (GetData /
-    /// GetObject), `src` the host→device data-out source (SendData / SendObject).
+    /// `req` is consumed and the decoded response [`Container`] is returned;
+    /// `dest` is the device→host data-in sink (GetData / GetObject), `src` the
+    /// host→device data-out source (SendData / SendObject).
     pub(crate) fn run_transaction(
         &mut self,
         req: Container,
@@ -62,8 +59,7 @@ impl<T: Transport> MtpSession<T> {
             Ok(rep) => Ok(rep),
             Err(e) => {
                 if e.poisons() {
-                    // mtp.go:391-392 — "fatal error %v; closing connection." then
-                    // d.Close(). shutdown() is Close()'s body.
+                    // Fatal error: close the connection. shutdown() is close()'s body.
                     log::warn!("fatal error {e}; closing connection.");
                     self.shutdown();
                 }
@@ -72,10 +68,10 @@ impl<T: Transport> MtpSession<T> {
         }
     }
 
-    /// `runTransaction` (mtp.go:401-510): the actual work, with **no** sanity
-    /// checking before/after. Used directly by `OpenSession` and `Close` so a
-    /// failure does not trigger the auto-close in [`Self::run_transaction`].
-    /// Returns the decoded response container.
+    /// The actual transaction work, with **no** sanity checking before/after.
+    /// Used directly by `OpenSession` and `close` so a failure does not trigger
+    /// the auto-close in [`Self::run_transaction`]. Returns the decoded response
+    /// container.
     pub(crate) fn run_transaction_raw(
         &mut self,
         mut req: Container,
@@ -84,29 +80,28 @@ impl<T: Transport> MtpSession<T> {
         write_size: u64,
         progress: &mut dyn FnMut(u64) -> Result<(), MtpError>,
     ) -> Result<Container, MtpError> {
-        // tid/sid stamping (mtp.go:404-408). Only when a session is open: the
-        // pre-session GetDeviceInfo and OpenSession itself go out with tid = 0.
+        // tid stamping. Only when a session is open: the pre-session
+        // GetDeviceInfo and OpenSession itself go out with tid = 0.
         if let Some(sess) = self.session.as_mut() {
             req.transaction_id = sess.tid;
-            sess.tid = sess.tid.wrapping_add(1); // uint32 wraparound, like Go.
+            sess.tid = sess.tid.wrapping_add(1); // u32 wraparound.
         }
 
-        // Command phase (mtp.go:414).
+        // Command phase.
         self.send_req(&req)?;
 
-        // Optional data-out phase (mtp.go:421-433).
+        // Optional data-out phase.
         if let Some(src) = src {
             self.bulk_write(req.code, req.transaction_id, src, write_size, progress)?;
         }
 
-        // Read the first packet after the command/data-out (mtp.go:434-440).
+        // Read the first packet after the command/data-out.
         let mps = self.transport.max_packet_size();
         let mut data = vec![0u8; mps];
         let (resp_header, resp_length, first_n, first_rest) = self.fetch_packet(&mut data)?;
 
         // If it is a DATA container, drain the data-in phase and then read the
-        // response; otherwise the first packet already IS the response
-        // (mtp.go:442-491).
+        // response; otherwise the first packet already IS the response.
         let (final_header, final_length, final_rest, unexpected_data) =
             if resp_header.kind == ContainerKind::Data {
                 self.read_data_phase(dest, first_n, resp_length, &first_rest, &mut data, progress)?
@@ -114,16 +109,14 @@ impl<T: Transport> MtpSession<T> {
                 (resp_header, resp_length, first_rest, false)
             };
 
-        // decodeRep + the post-checks (mtp.go:493-509). Note the ordering: the
-        // unexpected-data SyncError is returned *before* decodeRep's result is
-        // consulted (mtp.go:497-499).
+        // decode_rep + the post-checks. Note the ordering: the unexpected-data
+        // SyncError is returned *before* decode_rep's result is consulted.
         let mut rep = Container::default();
         let decode_result = decode_rep(&final_header, final_length, &final_rest, &mut rep);
 
         if unexpected_data {
-            // mtp.go:498 — getName(RC_names, req.Code) (yes, the RC map is
-            // deliberately looked up with the operation code; it almost always
-            // misses and prints "0x%x").
+            // The RC-name map is deliberately looked up with the *operation*
+            // code here; it almost always misses and prints "0x%x".
             return Err(MtpError::Sync(format!(
                 "unexpected data for code {}",
                 rc_or_hex(req.code)
@@ -132,7 +125,7 @@ impl<T: Transport> MtpSession<T> {
 
         decode_result?;
 
-        // tid mismatch — only meaningful with a session open (mtp.go:504-507).
+        // tid mismatch — only meaningful with a session open.
         if self.session.is_some() && rep.transaction_id != req.transaction_id {
             return Err(MtpError::Sync(format!(
                 "transaction ID mismatch got {:x} want {:x}",
@@ -143,14 +136,14 @@ impl<T: Transport> MtpSession<T> {
         Ok(rep)
     }
 
-    /// `sendReq` (mtp.go:291-318): encode the command header (`Type=COMMAND`,
-    /// `Length = 12 + 4*nparam`) + parameter words and write one bulk-OUT.
+    /// Encode the command header (`Type=COMMAND`, `Length = 12 + 4*nparam`) +
+    /// parameter words and write one bulk-OUT.
     fn send_req(&mut self, req: &Container) -> Result<(), MtpError> {
         let payload_len = (req.params.len() * 4) as u64;
         let mut buf = Vec::with_capacity(HDR_LEN as usize + req.params.len() * 4);
 
-        // Go's sendReq hardcodes Type=COMMAND regardless of the passed container;
-        // build a COMMAND-typed header from req's code/tid so we do the same.
+        // The command header is always Type=COMMAND regardless of the passed
+        // container; build a COMMAND-typed header from req's code/tid.
         let cmd = Container {
             kind: ContainerKind::Command,
             code: req.code,
@@ -168,15 +161,14 @@ impl<T: Transport> MtpSession<T> {
         Ok(())
     }
 
-    /// `fetchPacket` (mtp.go:322-337): read one max-packet-size bulk-IN and split
-    /// off the 12-byte header. Returns the header container, the raw `Length`
-    /// field, `n` (bytes read), and the payload bytes after the header.
+    /// Read one max-packet-size bulk-IN and split off the 12-byte header.
+    /// Returns the header container, the raw `Length` field, `n` (bytes read),
+    /// and the payload bytes after the header.
     ///
-    /// Trust-nothing hardening (the Go code trusted the device): a read shorter
-    /// than a header is a [`MtpError::Proto`] (non-fatal, like Go's
-    /// `io.ErrUnexpectedEOF`); a container `Type` outside 1..=4 — which Go read
-    /// raw and only rejected later in `decodeRep` as a `SyncError` — is mapped
-    /// straight to a fatal [`MtpError::Sync`].
+    /// Trust-nothing hardening: a read shorter than a header is a
+    /// [`MtpError::Proto`] (non-fatal); a container `Type` outside 1..=4 is
+    /// mapped straight to a fatal [`MtpError::Sync`] rather than being deferred
+    /// to `decode_rep`.
     fn fetch_packet(
         &mut self,
         data: &mut [u8],
@@ -210,9 +202,9 @@ impl<T: Transport> MtpSession<T> {
         Ok((header, length, n, rest))
     }
 
-    /// The DATA-container arm of `runTransaction` (mtp.go:442-491): write the
-    /// first packet's payload to `dest`, decide whether more packets follow
-    /// (running the SeparateHeader detection while we do), drain the rest via
+    /// The DATA-container arm of the transaction: write the first packet's
+    /// payload to `dest`, decide whether more packets follow (running the
+    /// SeparateHeader detection while we do), drain the rest via
     /// [`Self::bulk_read`], then obtain the response container — reusing
     /// `bulk_read`'s trailing packet (the XHCI case) or fetching a fresh one.
     ///
@@ -228,8 +220,8 @@ impl<T: Transport> MtpSession<T> {
     ) -> Result<(Container, u32, Vec<u8>, bool), MtpError> {
         let mut null_sink = NullSink;
         let mut unexpected = false;
-        // mtp.go:443-449 — no sink means the op expected no data; discard it and
-        // flag the transaction as a desync afterwards.
+        // No sink means the op expected no data; discard it and flag the
+        // transaction as a desync afterwards.
         let dest_ref: &mut dyn Write = match dest {
             Some(d) => d,
             None => {
@@ -238,14 +230,14 @@ impl<T: Transport> MtpSession<T> {
             }
         };
 
-        // mtp.go:454 — dest.Write(rest); the error is ignored in Go.
+        // Write the first packet's payload; the sink error is intentionally ignored.
         let _ = dest_ref.write_all(first_rest);
 
         let mps = self.transport.max_packet_size();
-        // "continue reading?" (mtp.go:456): a full first packet, or the device
-        // declared more than we have received.
+        // Continue reading? A full first packet, or the device declared more
+        // than we have received.
         if first_rest.len() + HDR_LEN as usize == mps || (first_n as u32) < first_length {
-            // SeparateHeader detection (mtp.go:464-469).
+            // SeparateHeader detection.
             if first_n == HDR_LEN as usize && first_rest.is_empty() && (first_n as u32) < first_length
             {
                 self.separate_header.detect_separate();
@@ -256,18 +248,17 @@ impl<T: Transport> MtpSession<T> {
 
             // Drain remaining data; final_packet may be the response (XHCI).
             let (_, final_packet, res) = self.bulk_read(dest_ref, progress);
-            res?; // mtp.go:475-477
+            res?;
 
-            // Response container (mtp.go:480-491).
+            // Response container.
             if !final_packet.is_empty() {
                 match Container::decode_header(&final_packet) {
                     Ok((hdr, len)) => {
                         let rest = final_packet[HDR_LEN as usize..].to_vec();
                         Ok((hdr, len, rest, unexpected))
                     }
-                    // Go feeds a zeroed header to decodeRep here (its binary.Read
-                    // error is discarded), which then fails the Type check as a
-                    // SyncError; we produce the equivalent fatal desync.
+                    // A malformed final packet is a fatal desync: the response
+                    // header failed to decode.
                     Err(_) => Err(MtpError::Sync(
                         "malformed final response packet".into(),
                     )),
@@ -278,16 +269,16 @@ impl<T: Transport> MtpSession<T> {
             }
         } else {
             // Small single-packet data phase: the whole payload was in the first
-            // packet; read a fresh packet for the response (mtp.go:489).
+            // packet; read a fresh packet for the response.
             let (hdr, len, _n, rest) = self.fetch_packet(data)?;
             Ok((hdr, len, rest, unexpected))
         }
     }
 
-    /// `bulkWrite` (mtp.go:529-603): stream the data-out phase. Writes the DATA
-    /// header (its own 12-byte packet when SeparateHeader, else header + first
-    /// chunk), then 16 KiB chunks, then a terminal zero-length packet when the
-    /// last transfer was max-packet-aligned. Returns non-header bytes written.
+    /// Stream the data-out phase. Writes the DATA header (its own 12-byte packet
+    /// when SeparateHeader, else header + first chunk), then 16 KiB chunks, then
+    /// a terminal zero-length packet when the last transfer was
+    /// max-packet-aligned. Returns non-header bytes written.
     fn bulk_write(
         &mut self,
         code: u16,
@@ -301,8 +292,8 @@ impl<T: Transport> MtpSession<T> {
         let packet_size = self.transport.max_packet_size();
         let mut n: u64 = 0;
 
-        // --- header + first chunk (mtp.go:532-566) ---
-        // Length = HDR_LEN + size, saturated to 0xFFFFFFFF (mtp.go:533-537) —
+        // --- header + first chunk ---
+        // Length = HDR_LEN + size, saturated to 0xFFFFFFFF —
         // Container::encode_header does exactly this.
         let hdr = Container {
             kind: ContainerKind::Data,
@@ -330,15 +321,15 @@ impl<T: Transport> MtpSession<T> {
         n += cp_size;
         progress(total_size - remaining)?;
 
-        // --- main loop, 16 KiB chunks (mtp.go:568-595) ---
+        // --- main loop, 16 KiB chunks ---
         let mut chunk = [0u8; RW_BUF_SIZE];
         let mut last_transfer: usize = 0;
         while remaining > 0 {
             let want = (RW_BUF_SIZE as u64).min(remaining) as usize;
             let m = match src.read(&mut chunk[..want]) {
-                Ok(0) => break,       // EOF — Go: r.Read err → break
+                Ok(0) => break,       // EOF
                 Ok(m) => m,
-                Err(_) => break,      // Go: if err != nil { break }
+                Err(_) => break,      // read error ends the phase
             };
             remaining -= m as u64;
             last_transfer = self
@@ -352,11 +343,11 @@ impl<T: Transport> MtpSession<T> {
             progress(total_size - remaining)?;
         }
 
-        // Terminal ZLP "just to be sure" when the last transfer filled a packet
-        // (mtp.go:597-600). NB last_transfer starts at 0, so a data phase that
-        // fit entirely in the first (short) packet still emits it, exactly like
-        // Go (0 % packet_size == 0). Requested as an empty bulk-OUT; keel-usb's
-        // Transport turns an empty write into the wire ZLP (see returned issues).
+        // Terminal ZLP "just to be sure" when the last transfer filled a packet.
+        // NB last_transfer starts at 0, so a data phase that fit entirely in the
+        // first (short) packet still emits it (0 % packet_size == 0). Requested
+        // as an empty bulk-OUT; keel-usb's Transport turns an empty write into
+        // the wire ZLP.
         if packet_size != 0 && last_transfer % packet_size == 0 {
             let _ = self.transport.bulk_out(&[], ZLP_TIMEOUT);
         }
@@ -364,11 +355,10 @@ impl<T: Transport> MtpSession<T> {
         Ok(n)
     }
 
-    /// `bulkRead` (mtp.go:605-657): read the data-in phase into `w` in 16 KiB
-    /// chunks until a short read, then — if the last read filled a packet —
-    /// perform the expected null-packet read. On Linux + XHCI that "null" read
-    /// is actually the `CONTAINER_OK` response, so we return it for the caller to
-    /// inspect (mtp.go:638-654).
+    /// Read the data-in phase into `w` in 16 KiB chunks until a short read, then
+    /// — if the last read filled a packet — perform the expected null-packet
+    /// read. On Linux + XHCI that "null" read is actually the `CONTAINER_OK`
+    /// response, so we return it for the caller to inspect.
     ///
     /// Returns `(bytes_written, trailing_packet, result)`. `trailing_packet` is
     /// empty unless the data ended on a packet boundary.
@@ -394,11 +384,10 @@ impl<T: Transport> MtpSession<T> {
             if last_read > 0 {
                 match w.write(&buf[..last_read]) {
                     Ok(written) => n += written as u64,
-                    // go-mtpfs mtp.go:619-622 shadows `err` here, so a sink write
-                    // error is swallowed and the loop just breaks (the outer
-                    // `err` — returned — stays whatever the last bulk-IN was,
-                    // i.e. nil). Preserved: the plan's fix list (§3.5) does not
-                    // include this, and matching it keeps conformance parity.
+                    // A sink write error is deliberately swallowed here: the loop
+                    // just breaks, and the returned result stays whatever the last
+                    // bulk-IN was (i.e. Ok). Preserved intentionally to keep
+                    // conformance parity with the wire contract.
                     Err(_) => break,
                 }
             }
@@ -420,8 +409,8 @@ impl<T: Transport> MtpSession<T> {
         if packet_size != 0 && last_read % packet_size == 0 {
             // Expected null packet — on XHCI it is the response instead.
             let null_read_size = match self.transport.bulk_in(&mut buf, self.timeout) {
-                // Go: `nullReadSize, err = BulkTransfer(...)` overwrites err (so a
-                // successful read clears a prior progress error to nil).
+                // A successful null-packet read overwrites any prior progress
+                // error, clearing result back to Ok.
                 Ok(r) => {
                     result = Ok(());
                     r
@@ -431,8 +420,8 @@ impl<T: Transport> MtpSession<T> {
                     0
                 }
             };
-            // Go calls progressCb(n) again and returns *its* error if any
-            // (mtp.go:649-651), else the (overwritten) err.
+            // Call progress(n) again and return *its* error if any, else the
+            // (overwritten) result.
             if let Err(e) = progress(n) {
                 return (n, buf[..null_read_size].to_vec(), Err(e));
             }
@@ -443,11 +432,11 @@ impl<T: Transport> MtpSession<T> {
     }
 }
 
-/// `decodeRep` (mtp.go:339-361): validate the response header and parse its
-/// parameter words into `rep`. A non-RESPONSE type is a fatal desync
-/// (`SyncError`); an over-long declared length is a non-fatal decode error; a
-/// non-OK code becomes an [`MtpError::Rc`]. Parameters are parsed *before* the
-/// OK check, so error responses still expose any params they carry.
+/// Validate the response header and parse its parameter words into `rep`. A
+/// non-RESPONSE type is a fatal desync ([`MtpError::Sync`]); an over-long
+/// declared length is a non-fatal decode error; a non-OK code becomes an
+/// [`MtpError::Rc`]. Parameters are parsed *before* the OK check, so error
+/// responses still expose any params they carry.
 fn decode_rep(
     header: &Container,
     length: u32,
@@ -455,7 +444,6 @@ fn decode_rep(
     rep: &mut Container,
 ) -> Result<(), MtpError> {
     if header.kind != ContainerKind::Response {
-        // mtp.go:341.
         return Err(MtpError::Sync(format!(
             "got type {} ({}) in response, want CONTAINER_RESPONSE.",
             header.kind as u16,
@@ -468,13 +456,12 @@ fn decode_rep(
     rep.transaction_id = header.transaction_id;
     rep.params.clear();
 
-    // restLen := int(h.Length) - usbHdrLen (mtp.go:347). Signed: a Length < 12
-    // yields a negative restLen → 0 params (Go's `for i:=0; i<nParam` no-ops).
+    // Signed subtraction: a Length < 12 yields a negative rest_len, which then
+    // produces 0 params (the loop below no-ops).
     let rest_len = length as i64 - HDR_LEN as i64;
     if rest_len > rest.len() as i64 {
-        // mtp.go:348-350 — a plain fmt.Errorf (non-fatal). We reuse Truncated;
-        // its Display differs from Go's "header specified …" string, but that
-        // text is not matched anywhere.
+        // Non-fatal: the declared length overruns what we actually read. We
+        // surface it as Truncated; the exact message text is not matched anywhere.
         return Err(MtpError::Proto(keel_proto::ProtoError::Truncated {
             need: rest_len.max(0) as usize,
             have: rest.len(),
@@ -492,15 +479,14 @@ fn decode_rep(
     }
 
     if rep.code != RespCode::OK.0 {
-        // mtp.go:357-359 — RCError(rep.Code). Non-fatal.
+        // Non-OK response code → RC error. Non-fatal.
         return Err(MtpError::Rc(RcError(RespCode(rep.code))));
     }
     Ok(())
 }
 
-/// go-mtpfs `getName(RC_names, code)` (print.go:39-45): the RC spec name or, on
-/// a miss, `"0x%x"` (lowercase, no padding). Deliberately used with an *op* code
-/// for the unexpected-data message, matching mtp.go:498.
+/// The RC spec name for `code`, or on a miss `"0x%x"` (lowercase, no padding).
+/// Deliberately used with an *op* code for the unexpected-data message.
 fn rc_or_hex(code: u16) -> String {
     match RespCode(code).name() {
         Some(n) => n.to_string(),
@@ -508,8 +494,7 @@ fn rc_or_hex(code: u16) -> String {
     }
 }
 
-/// go-mtpfs `USB_names` (const.go:1937-1943) via `getName` — container-type name
-/// for the desync messages. Values are USB-IF spec facts.
+/// Container-type name for the desync messages. Values are USB-IF spec facts.
 fn usb_container_name(ty: u16) -> String {
     match ty {
         0x0000 => "CONTAINER_UNDEFINED".to_string(),
@@ -522,8 +507,8 @@ fn usb_container_name(ty: u16) -> String {
     }
 }
 
-/// `io.CopyN(out, src, n)` semantics (mtp.go:554): copy up to `n` bytes; a short
-/// read or read error ends the copy (Go discards the error). Never panics.
+/// Copy up to `n` bytes from `src` into `out`; a short read or read error ends
+/// the copy (the error is discarded). Never panics.
 fn copy_n(src: &mut dyn Read, n: u64, out: &mut Vec<u8>) {
     let mut remaining = n;
     let mut tmp = [0u8; RW_BUF_SIZE];
@@ -540,8 +525,8 @@ fn copy_n(src: &mut dyn Read, n: u64, out: &mut Vec<u8>) {
     }
 }
 
-/// go-mtpfs `NullWriter` (nullreader.go): a sink that accepts and discards
-/// everything, used when a data phase arrives for an op that expected none.
+/// A sink that accepts and discards everything, used when a data phase arrives
+/// for an op that expected none.
 struct NullSink;
 
 impl Write for NullSink {

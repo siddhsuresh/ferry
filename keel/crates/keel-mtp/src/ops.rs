@@ -1,25 +1,20 @@
 //! The MTP operations Ferry needs, as `impl MtpSession` blocks.
 //!
-//! Faithful port of go-mtpfs `mtp/ops.go`. Each method builds a command
-//! [`Container`], drives it through the transaction engine
-//! ([`MtpSession::run_transaction`], ported in `transaction.rs`), and decodes the
-//! result — mirroring the Go `Device` receiver methods one-for-one.
+//! Each method builds a command [`Container`], drives it through the transaction
+//! engine ([`MtpSession::run_transaction`]), and decodes the result.
 //!
-//! Scope (plan §2 keel-mtp `ops` table + docs/CONTRACTS.md `MtpSession` surface):
-//! only the operations Ferry / go-mtpx actually invoke. The other ops.go
-//! functions — `GetObjectPropDesc`, `GetObjectPropsSupported`, `GetDevicePropDesc`,
+//! Scope: only the operations Ferry actually invokes. The other MTP operations —
+//! `GetObjectPropDesc`, `GetObjectPropsSupported`, `GetDevicePropDesc`,
 //! `GetDevicePropValue`, `SetDevicePropValue`, `ResetDevicePropValue`,
-//! `GetNumObjects`, and the buggy `GetPartialObject` (ops.go:215-220) — are
-//! intentionally NOT ported here: go-mtpx never calls them, they are outside the
-//! fixed contract surface, and `GetPartialObject` is superseded by
-//! `android.rs::get_partial_object_64` (the plan §3.5 opcode/param fix).
-//! `OpenSession`/`CloseSession` (ops.go:19-50) live in `session.rs` because they
-//! own the `tid`/`sid` session state and the Configure recovery ladder.
+//! `GetNumObjects`, and a buggy 3-param `GetPartialObject` — are intentionally
+//! left out: nothing on the contract surface calls them, and partial reads go
+//! through the 64-bit path in `android.rs` instead. `OpenSession` /
+//! `CloseSession` live in `session.rs` because they own the `tid`/`sid` session
+//! state and the Configure recovery ladder.
 //!
-//! DATA DIRECTION CONVENTION (matches Go `runTransaction(req, rep, dest, src, …)`,
-//! mtp.go:401): `data_in` is the device→host data phase (`dest`, GetData /
-//! GetObject); `data_out` is the host→device data phase (`src`, SendData /
-//! SendObject). `write_size` is the byte count of the `data_out` phase.
+//! DATA DIRECTION CONVENTION: `data_in` is the device→host data phase (GetData /
+//! GetObject); `data_out` is the host→device data phase (SendData / SendObject).
+//! `write_size` is the byte count of the `data_out` phase.
 
 use std::io::{Cursor, Read, Write};
 
@@ -40,11 +35,10 @@ use crate::transport::Transport;
 ///
 /// [`MtpSession::get_object`] wraps the caller's sink in this so it can return the
 /// total object byte count (the contract's `Result<u64>`) without depending on
-/// what `run_transaction` returns. Go's `GetObject` (ops.go:207-213) returned only
-/// an error; the byte total is a keel addition (docs/CONTRACTS.md). Counting at
-/// the sink is more accurate than the Go progress callback, which omitted the
-/// first data packet's bytes (mtp.go:454 writes `rest` before `bulkRead` starts
-/// its own counter) — but that quirk lives in the progress values, not the total.
+/// what `run_transaction` returns. Counting at the sink is exact: it includes
+/// the first data packet, which the running progress counter omits — so the
+/// total is trustworthy even though the progress values undercount by that first
+/// packet.
 struct CountingWriter<'a> {
     inner: &'a mut dyn Write,
     count: u64,
@@ -65,24 +59,21 @@ impl Write for CountingWriter<'_> {
 ///
 /// `GetObjectPropValue`'s response is a bare, untyped value: the wire carries no
 /// data-type tag because the type is fixed by the property's `ObjectPropDesc`
-/// (MTP spec §5). Go decoded it by having the caller pass a concrete target
-/// (`*Uint64Value` for `OPC_ObjectSize`, `*StringValue` for `OPC_ObjectFileName`
-/// — go-mtpx helpers.go:21,92) whose Go type drove reflection. keel's contract
-/// returns a tagged [`PropValue`], so the type must be recovered from the property
-/// code here rather than from a round-trip to `GetObjectPropDesc` (which Go also
-/// avoided). The two load-bearing entries for Ferry are `OBJECT_SIZE` (u64) and
-/// `OBJECT_FILE_NAME` (str); the rest are standard USB-IF spec facts for
-/// completeness. Selectors are the DTC_* codes (const.go:742-754), duplicated as
-/// literals here to stay decoupled from `consts`/`datasets` internals.
+/// (MTP spec §5). The contract returns a tagged [`PropValue`], so the type must
+/// be recovered from the property code here rather than from a round-trip to
+/// `GetObjectPropDesc`. The two load-bearing entries for Ferry are `OBJECT_SIZE`
+/// (u64) and `OBJECT_FILE_NAME` (str); the rest are standard USB-IF spec facts
+/// for completeness. Selectors are the DTC_* data-type codes, inlined as literals
+/// here to stay decoupled from `consts`/`datasets` internals.
 fn object_prop_datatype(prop: ObjectPropCode) -> Option<u16> {
     Some(match prop.0 {
         0xDC01 => 0x0006, // StorageID: UINT32
         0xDC02 => 0x0004, // ObjectFormat: UINT16
         0xDC03 => 0x0004, // ProtectionStatus: UINT16
-        0xDC04 => 0x0008, // ObjectSize: UINT64            <-- Ferry (helpers.go:21)
+        0xDC04 => 0x0008, // ObjectSize: UINT64            <-- Ferry
         0xDC05 => 0x0004, // AssociationType: UINT16
         0xDC06 => 0x0006, // AssociationDesc: UINT32
-        0xDC07 => 0xFFFF, // ObjectFileName: STR           <-- Ferry (helpers.go:92, main.go:252)
+        0xDC07 => 0xFFFF, // ObjectFileName: STR           <-- Ferry
         0xDC08 => 0xFFFF, // DateCreated: STR
         0xDC09 => 0xFFFF, // DateModified: STR
         0xDC0A => 0xFFFF, // Keywords: STR
@@ -98,13 +89,12 @@ fn object_prop_datatype(prop: ObjectPropCode) -> Option<u16> {
 
 impl<T: Transport> MtpSession<T> {
     // -----------------------------------------------------------------------
-    // Internal data-phase helpers (ops.go GetData:52-63 / SendData:98-107).
+    // Internal data-phase helpers.
     // -----------------------------------------------------------------------
 
     /// Run a command whose only useful output is its device→host data phase,
-    /// collecting that phase into a byte buffer for the caller to decode.
-    /// Faithful port of ops.go `GetData` (52-63); the returned response
-    /// container is discarded (Go kept only the decoded dataset).
+    /// collecting that phase into a byte buffer for the caller to decode. The
+    /// response container is discarded; only the decoded dataset matters.
     fn get_data(&mut self, req: Container) -> Result<Vec<u8>, MtpError> {
         let mut buf: Vec<u8> = Vec::new();
         let mut noprog = |_: u64| Ok::<(), MtpError>(());
@@ -112,10 +102,9 @@ impl<T: Transport> MtpSession<T> {
         Ok(buf)
     }
 
-    /// Encode `payload` and run a command with a host→device data phase.
-    /// Faithful port of ops.go `SendData` (98-107). Returns the response
-    /// container so callers that need response parameters (SendObjectInfo) can
-    /// read them.
+    /// Encode `payload` and run a command with a host→device data phase. Returns
+    /// the response container so callers that need response parameters
+    /// (SendObjectInfo) can read them.
     fn send_data(&mut self, req: Container, payload: Vec<u8>) -> Result<Container, MtpError> {
         let size = payload.len() as u64;
         let mut cur = Cursor::new(payload);
@@ -124,10 +113,10 @@ impl<T: Transport> MtpSession<T> {
     }
 
     // -----------------------------------------------------------------------
-    // The operations (docs/CONTRACTS.md MtpSession surface).
+    // The operations (the MtpSession contract surface).
     // -----------------------------------------------------------------------
 
-    /// `GetDeviceInfo` (ops.go:65-69).
+    /// `GetDeviceInfo`.
     pub fn device_info(&mut self) -> Result<DeviceInfo, MtpError> {
         let req = Container {
             code: OpCode::GET_DEVICE_INFO.0,
@@ -138,7 +127,7 @@ impl<T: Transport> MtpSession<T> {
         DeviceInfo::decode(&mut cur).map_err(MtpError::Proto)
     }
 
-    /// `GetStorageIDs` (ops.go:71-75) — decodes a `Uint32Array` (types.go:91).
+    /// `GetStorageIDs` — decodes a `Uint32Array`.
     pub fn storage_ids(&mut self) -> Result<Vec<u32>, MtpError> {
         let req = Container {
             code: OpCode::GET_STORAGE_IDS.0,
@@ -149,7 +138,7 @@ impl<T: Transport> MtpSession<T> {
         Ok(Uint32Array::decode(&mut cur).map_err(MtpError::Proto)?.values)
     }
 
-    /// `GetStorageInfo` (ops.go:145-150).
+    /// `GetStorageInfo`.
     pub fn storage_info(&mut self, sid: u32) -> Result<StorageInfo, MtpError> {
         let req = Container {
             code: OpCode::GET_STORAGE_INFO.0,
@@ -161,13 +150,12 @@ impl<T: Transport> MtpSession<T> {
         StorageInfo::decode(&mut cur).map_err(MtpError::Proto)
     }
 
-    /// `GetObjectHandles` (ops.go:152-157).
+    /// `GetObjectHandles`.
     ///
-    /// `format` is the ObjectFormatCode filter: **0 means "all formats"**
-    /// (ops.go:155 passes it straight through; go-mtpx's `GOH_ALL_ASSOCS`
-    /// name for the 0 constant is a misnomer — 0 is "all", not "associations",
-    /// per plan §2 keel-vfs `path` — so keel does not "correct" it). `parent`
-    /// 0xFFFFFFFF is the storage root.
+    /// `format` is the ObjectFormatCode filter: **0 means "all formats"** and is
+    /// passed straight through (despite the occasional "all associations"
+    /// misnomer for the 0 constant, 0 means all formats). `parent` 0xFFFFFFFF is
+    /// the storage root.
     pub fn object_handles(
         &mut self,
         sid: u32,
@@ -184,7 +172,7 @@ impl<T: Transport> MtpSession<T> {
         Ok(Uint32Array::decode(&mut cur).map_err(MtpError::Proto)?.values)
     }
 
-    /// `GetObjectInfo` (ops.go:159-164).
+    /// `GetObjectInfo`.
     pub fn object_info(&mut self, handle: u32) -> Result<ObjectInfo, MtpError> {
         let req = Container {
             code: OpCode::GET_OBJECT_INFO.0,
@@ -196,15 +184,15 @@ impl<T: Transport> MtpSession<T> {
         ObjectInfo::decode(&mut cur).map_err(MtpError::Proto)
     }
 
-    /// `GetObject` (ops.go:207-213) — streams the object's data phase to `sink`,
-    /// reporting cumulative bytes through `progress` (the object `handle` is
-    /// threaded into the second callback slot for the vfs/ffi layer's context).
+    /// `GetObject` — streams the object's data phase to `sink`, reporting
+    /// cumulative bytes through `progress` (the object `handle` is threaded into
+    /// the second callback slot for the vfs/ffi layer's context).
     ///
     /// Returns the total bytes written to `sink`. The >4 GiB path is transparent
     /// here: the transaction engine keeps reading until a short packet regardless
     /// of the 0xFFFFFFFF length sentinel, and re-fetching the real size via
     /// `OPC_ObjectSize` when `ObjectInfo.CompressedSize` is saturated is the vfs
-    /// layer's job (go-mtpx helpers.go:20) — ops just streams.
+    /// layer's job — ops just streams.
     pub fn get_object(
         &mut self,
         handle: u32,
@@ -260,11 +248,11 @@ impl<T: Transport> MtpSession<T> {
         }
     }
 
-    /// `DeleteObject` (ops.go:176-182).
+    /// `DeleteObject`.
     ///
     /// Params are `{handle, 0x0}`: the trailing `0` is the ObjectFormatCode slot
-    /// (0 = all formats). Go passes it explicitly (ops.go:179) — some devices
-    /// reject the single-parameter form, so the `0` is load-bearing, not padding.
+    /// (0 = all formats). Some devices reject the single-parameter form, so the
+    /// `0` is load-bearing, not padding.
     pub fn delete_object(&mut self, handle: u32) -> Result<(), MtpError> {
         let req = Container {
             code: OpCode::DELETE_OBJECT.0,
@@ -276,16 +264,14 @@ impl<T: Transport> MtpSession<T> {
         Ok(())
     }
 
-    /// `SendObjectInfo` (ops.go:184-199) — sends an [`ObjectInfo`] dataset and
-    /// returns the **new object handle** the device assigned.
+    /// `SendObjectInfo` — sends an [`ObjectInfo`] dataset and returns the **new
+    /// object handle** the device assigned.
     ///
-    /// Go returned `(storageID, parent, handle)` = `rep.Param[0..3]`, but every
-    /// go-mtpx caller discards the first two (`_, _, objId, err :=`,
-    /// helpers.go:220,255), so the contract returns only the handle
-    /// (`rep.Param[2]`). The "need 3 response parameters" guard (ops.go:193-195)
-    /// is preserved; a shorter response is a malformed dataset, surfaced as a
-    /// non-poisoning `Proto` error (Go used a plain `fmt.Errorf`, which — unlike a
-    /// `SyncError` — did not close the connection, mtp.go:388-393).
+    /// The device replies with `(storageID, parent, handle)`, but every caller
+    /// discards the first two, so the contract returns only the handle
+    /// (`params[2]`). The "need 3 response parameters" guard is preserved; a
+    /// shorter response is a malformed dataset, surfaced as a non-poisoning
+    /// `Proto` error that does not close the connection.
     pub fn send_object_info(
         &mut self,
         sid: u32,
@@ -301,9 +287,9 @@ impl<T: Transport> MtpSession<T> {
         info.encode(&mut payload);
         let rep = self.send_data(req, payload)?;
         if rep.params.len() < 3 {
-            // ops.go:193-195. No `MtpError` "Other(String)" variant exists (the
-            // contract enum is fixed), so a too-short response is reported as a
-            // truncated dataset — the closest non-poisoning classification.
+            // No `MtpError` "Other(String)" variant exists (the contract enum is
+            // fixed), so a too-short response is reported as a truncated dataset
+            // — the closest non-poisoning classification.
             return Err(MtpError::Proto(ProtoError::Truncated {
                 need: 3,
                 have: rep.params.len(),
@@ -312,11 +298,10 @@ impl<T: Transport> MtpSession<T> {
         Ok(rep.params[2])
     }
 
-    /// `SendObject` (ops.go:201-205) — streams `size` bytes from `source` as the
-    /// object's data phase. Has no parameters: the object was described by the
+    /// `SendObject` — streams `size` bytes from `source` as the object's data
+    /// phase. Has no parameters: the object was described by the
     /// immediately-preceding `SendObjectInfo`. No handle exists at this point, so
-    /// the progress callback's handle slot is `0` (go-mtpx's own progress closure
-    /// ignores it, helpers.go:262).
+    /// the progress callback's handle slot is `0`.
     pub fn send_object(
         &mut self,
         source: &mut dyn Read,
@@ -332,8 +317,8 @@ impl<T: Transport> MtpSession<T> {
         Ok(())
     }
 
-    /// `GetObjectPropValue` (ops.go:84-89) for the standard properties Ferry
-    /// reads. The response is decoded per the property's fixed MTP data type (see
+    /// `GetObjectPropValue` for the standard properties Ferry reads. The response
+    /// is decoded per the property's fixed MTP data type (see
     /// [`object_prop_datatype`]); an unmapped property yields a `Proto` error
     /// rather than a wrong-typed decode.
     pub fn object_prop_value(
@@ -354,11 +339,10 @@ impl<T: Transport> MtpSession<T> {
         decode_prop_value(&mut cur, selector).map_err(MtpError::Proto)
     }
 
-    /// `SetObjectPropValue` (ops.go:91-96) — used for rename (property
-    /// `OPC_ObjectFileName`, go-mtpx main.go:252). The value is encoded from the
-    /// caller-supplied [`PropValue`], which already carries its type, so no
-    /// property→type lookup is needed on this path. The response is ignored, as
-    /// in Go.
+    /// `SetObjectPropValue` — used for rename (property `OPC_ObjectFileName`).
+    /// The value is encoded from the caller-supplied [`PropValue`], which already
+    /// carries its type, so no property→type lookup is needed on this path. The
+    /// response is ignored.
     pub fn set_object_prop_value(
         &mut self,
         handle: u32,

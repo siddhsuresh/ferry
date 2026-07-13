@@ -1,26 +1,15 @@
-# Ferry — notices and attribution
+# Ferry — notices
 
-## Project license
+## License
 
-Ferry's source code, including the Swift application and the in-tree Rust
-crates under `keel/`, is licensed under the MIT License in [LICENSE](LICENSE).
+Ferry's source code, including the Swift application and the Rust crates under
+`keel/`, is licensed under the MIT License in [LICENSE](LICENSE).
 
-## Current runtime
+## Dependencies
 
-The application ships Ferry's SwiftUI code and the in-tree Rust
-`keel.dylib` MTP/PTP kernel. The kernel uses `nusb` for USB access and links
-against macOS system frameworks and libraries supplied by macOS, including
-IOKit and CoreFoundation.
+The Rust portion of Ferry uses the following direct third-party dependencies:
 
-Ferry does not bundle the Go MTP kernel, `kalam.dylib`, `libusb`, or the
-OpenMTP application.
-
-## Direct Rust dependencies
-
-The direct third-party dependencies declared by the Rust workspace are
-permissively licensed:
-
-| Dependency | License expression |
+| Dependency | License |
 | --- | --- |
 | `nusb` 0.2.4 | Apache-2.0 OR MIT |
 | `serde` 1.0.228 | MIT OR Apache-2.0 |
@@ -29,23 +18,33 @@ permissively licensed:
 | `log` 0.4.33 | MIT OR Apache-2.0 |
 | `env_logger` 0.11.11 | MIT OR Apache-2.0 |
 | `futures` 0.3.32 | MIT OR Apache-2.0 |
-| `futures-timer` 3.0.4 | MIT/Apache-2.0 |
+| `futures-timer` 3.0.4 | MIT OR Apache-2.0 |
 | `rand` 0.8.7 | MIT OR Apache-2.0 |
 | `core-foundation` 0.10.1 | MIT OR Apache-2.0 |
 | `io-kit-sys` 0.5.0 | MIT OR Apache-2.0 |
 
-The exact resolved dependency graph is recorded in `keel/Cargo.lock`. License
-metadata for that graph can be inspected with:
+The complete resolved dependency graph is recorded in `keel/Cargo.lock`. To
+inspect it, including the transitive dependencies:
 
 ```sh
 cd keel
-cargo metadata --format-version 1
+cargo tree                # the full graph
+cargo license             # per-crate license roll-up (needs cargo-license)
 ```
 
-## Historical attribution
+The Swift application (the `Sources/` targets) has **no third-party
+dependencies** — it links only Apple's macOS system frameworks and libraries,
+including SwiftUI, AppKit, IOKit, and CoreFoundation. These are supplied by
+macOS and are not bundled third-party components.
 
-The `keel` implementation is a Rust reimplementation of MTP/PTP behavior
-based on the public USB-IF specifications and compatibility observations from
-`go-mtpfs`, `go-mtpx`, and OpenMTP by Ganesh Rathinavel. Those projects are
-acknowledged as references only; their source code, binaries, and repositories
-are not components of the current Ferry distribution.
+## Attribution
+
+Ferry's MTP/PTP implementation is in-tree Rust code developed from the public
+USB-IF specifications and compatibility research informed by OpenMTP,
+`go-mtpfs`, and `go-mtpx`. Those projects are acknowledged for attribution;
+their source code and binaries are not included in Ferry.
+
+The JSON fixtures under `keel/fixtures/golden/` are behavioral test captures —
+recorded output of a prior kernel observed against a real device — used to
+verify Ferry's own implementation. They are test data, not third-party source
+code or binaries.

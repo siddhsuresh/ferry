@@ -29,8 +29,7 @@ pub enum TransportError {
     /// Transfer timed out (recoverable at the transaction layer's discretion).
     Timeout,
     /// Device left the bus. Display MUST contain "LIBUSB_ERROR_NO_DEVICE" —
-    /// the FFI error mapper string-matches it to produce ErrorDeviceChanged,
-    /// exactly like the Go/libusb stack did.
+    /// the FFI error mapper string-matches it to produce ErrorDeviceChanged.
     DeviceGone,
     /// Endpoint stalled.
     Stall,

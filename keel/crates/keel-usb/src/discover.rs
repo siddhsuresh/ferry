@@ -1,14 +1,10 @@
-//! Device discovery + selection.
-//!
-//! Ports go-mtpfs `mtp/select.go` (`candidateFromDeviceDescriptor`,
-//! `FindDevices`, `selectDevice`) and the MTP-ness probe from `mtp/mtp.go`
-//! `Device.Open`, onto nusb 0.2.4.
+//! Device discovery + selection over nusb 0.2.4.
 //!
 //! Candidate matching is by **endpoint shape**, never by class: the target
 //! phones (VID 18d1, confirmed) are vendor class 0xFF, so class 6 (Still Image)
-//! is unreliable. A candidate interface has exactly three endpoints —
-//! bulk-IN + bulk-OUT + interrupt-IN — exactly Go's `candidateFromDeviceDescriptor`
-//! (`len(a.EndPoints) != 3 { continue }`, then require send/fetch/event EPs).
+//! is unreliable. A candidate interface has exactly three endpoints — one
+//! bulk-IN (fetch), one bulk-OUT (send), one interrupt-IN (event); anything
+//! else is skipped.
 
 use nusb::descriptors::TransferType;
 use nusb::transfer::Direction;
@@ -33,17 +29,15 @@ pub struct Discovered {
     pub usb_info: UsbInfo,
 }
 
-/// Discovery failures. `NoDevice` / `MultipleDevices` Display text is fixed by
-/// CONTRACTS.md (the FFI error mapper string-matches it).
+/// Discovery failures. `NoDevice` / `MultipleDevices` Display text is part of the
+/// wire contract — the FFI error mapper string-matches it.
 ///
-/// `ExclusiveAccess` is a keel **extension** to the CONTRACTS.md enum (documented
-/// there as the addition keel-usb makes): Ferry has zero exclusive-access
-/// handling today (plan risk #2), and this carries the IORegistry-named holder
-/// up so keel-vfs → keel-ffi can surface "Quit <app> and try again".
+/// `ExclusiveAccess` carries the IORegistry-named holder up so keel-vfs → keel-ffi
+/// can surface "Quit <app> and try again" when another process owns the device.
 pub enum DiscoverError {
-    /// Display == "no MTP devices found" (go-mtpfs select.go:90).
+    /// Display == "no MTP devices found".
     NoDevice,
-    /// Display contains "more than 1 device" (go-mtpfs select.go:117).
+    /// Display contains "more than 1 device".
     MultipleDevices(usize),
     /// ptpcamerad / Image Capture / Photos / Smart Switch holds the device.
     /// `owner` is the IORegistry-named process, best-effort (may be `None`).
@@ -60,7 +54,8 @@ impl std::fmt::Display for DiscoverError {
         match self {
             // EXACT string — matched verbatim downstream.
             DiscoverError::NoDevice => write!(f, "no MTP devices found"),
-            // Must CONTAIN "more than 1 device"; keep the "mtp:" prefix from Go.
+            // Must CONTAIN "more than 1 device"; the "mtp:" prefix is required by
+            // the wire contract.
             DiscoverError::MultipleDevices(n) => {
                 write!(f, "mtp: more than 1 device: found {n} MTP candidates")
             }
@@ -88,12 +83,12 @@ impl std::fmt::Debug for DiscoverError {
 
 impl std::error::Error for DiscoverError {}
 
-/// Find one MTP device, faithful to go-mtpfs `SelectDevice("")`.
+/// Find one MTP device.
 ///
 /// Enumerate → build endpoint-shape candidates → open/claim/probe each → count.
 /// Zero opened ⇒ `NoDevice` (or a surfaced exclusive/plugin/other error if one
 /// blocked the only plausible device). Exactly one ⇒ return it. More than one ⇒
-/// `MultipleDevices` (Go hard-errors here; relaxed post-parity per plan §10).
+/// `MultipleDevices`.
 pub fn discover() -> Result<Discovered, DiscoverError> {
     let devices = blocking(nusb::list_devices()).map_err(|e| DiscoverError::Other(e.to_string()))?;
 
@@ -120,7 +115,7 @@ pub fn discover() -> Result<Discovered, DiscoverError> {
             Err(OpenError::PlugIn(m)) => {
                 plugin.get_or_insert(m);
             }
-            Err(OpenError::Gone) => {} // Go's `continue` — device left mid-scan
+            Err(OpenError::Gone) => {} // device left mid-scan — skip it
             Err(OpenError::Other(m)) => {
                 other.get_or_insert(m);
             }
@@ -146,11 +141,10 @@ pub fn discover() -> Result<Discovered, DiscoverError> {
 
 /// Cheap pre-filter over the enumeration summary (no device open).
 ///
-/// go-mtpfs inspects the config descriptors of *every* device on the bus. We
-/// can't see endpoints without opening on nusb, so we first skip the obvious
-/// non-candidates (hubs, keyboards, audio, …) to avoid opening — and possibly
-/// perturbing — unrelated devices. The endpoint-shape check below remains the
-/// actual decider; this only narrows what we bother opening.
+/// We can't see endpoints without opening a device on nusb, so we first skip the
+/// obvious non-candidates (hubs, keyboards, audio, …) to avoid opening — and
+/// possibly perturbing — unrelated devices. The endpoint-shape check below
+/// remains the actual decider; this only narrows what we bother opening.
 fn plausible(di: &DeviceInfo) -> bool {
     // Hubs never carry an MTP interface.
     if di.class() == 0x09 {
@@ -181,14 +175,12 @@ struct Candidate {
 
 /// Scan every configuration/alt-setting for the MTP endpoint shape.
 ///
-/// Faithful to `candidateFromDeviceDescriptor` (select.go:11-49): exactly three
-/// endpoints — one bulk-IN, one bulk-OUT, one interrupt-IN. Returns the first
-/// match, in descriptor order.
+/// Exactly three endpoints — one bulk-IN, one bulk-OUT, one interrupt-IN. Returns
+/// the first match, in descriptor order.
 fn find_mtp_interface(device: &Device) -> Option<Candidate> {
     for config in device.configurations() {
         let config_value = config.configuration_value();
         for alt in config.interface_alt_settings() {
-            // Go: `if len(a.EndPoints) != 3 { continue }`.
             if alt.endpoints().count() != 3 {
                 continue;
             }
@@ -233,22 +225,20 @@ fn try_open_candidate(di: &DeviceInfo) -> Result<Option<Discovered>, OpenError> 
 
     let interface = claim_with_ladder(&device, di, cand.interface_number, cand.config_value)?;
 
-    // MTP-ness probe (go-mtpfs Open, mtp.go:172-200).
+    // MTP-ness probe.
     match interface_string_for(di, cand.interface_number) {
         Some(s) => {
-            // Old-Samsung allowance: CDC/ACM count as MTP (mtp.go:196).
+            // Old-Samsung allowance: CDC/ACM count as MTP.
             if !(s.contains("MTP") || s.contains("CDC") || s.contains("ACM")) {
                 return Ok(None);
             }
         }
         None => {
-            // SEAM (plan `keel-usb probe`): Go's InterfaceStringIndex == 0 branch
-            // runs a pre-session GetDeviceInfo and accepts
-            // microsoft/WindowsPhone or fujifilm.co.jp extensions. Wiring a real
-            // GetDeviceInfo here needs keel-mtp's transaction engine (a bare,
-            // session-less RunTransaction on this very transport), which is being
-            // written concurrently; do it at the gate. The endpoint shape has
-            // already matched, so we accept — see open issues.
+            // No interface string published. A full confirmation would run a
+            // pre-session GetDeviceInfo and accept microsoft/WindowsPhone or
+            // fujifilm.co.jp extensions, which needs keel-mtp's transaction engine
+            // (a bare, session-less transaction on this very transport). The
+            // endpoint shape has already matched, so we accept here.
         }
     }
 

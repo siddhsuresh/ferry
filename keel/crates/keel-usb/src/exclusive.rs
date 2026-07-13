@@ -1,12 +1,10 @@
 //! Naming the process that holds a USB device exclusively (ptpcamerad, Image
 //! Capture, Photos, Smart Switch, …) via the macOS IORegistry.
 //!
-//! This is built from scratch: mtp-rs only *classifies* exclusive access (it has
-//! ZERO IOKit code, per docs/nusb-api.md §4), and Ferry today has no handling at
-//! all (plan risk #2). When `claim_interface` fails with `kIOReturnExclusiveAccess`
-//! (nusb `ErrorKind::Busy`), we open the device's IORegistry entry and read a
-//! string property naming the holder so keel-vfs → keel-ffi can tell the user
-//! exactly which app to quit.
+//! When `claim_interface` fails with `kIOReturnExclusiveAccess` (nusb
+//! `ErrorKind::Busy`), we open the device's IORegistry entry and read a string
+//! property naming the holder so keel-vfs → keel-ffi can tell the user exactly
+//! which app to quit.
 //!
 //! ## HARDWARE-UNVERIFIED — flagged for the human's on-device pass
 //!

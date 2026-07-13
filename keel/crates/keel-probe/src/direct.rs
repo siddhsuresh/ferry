@@ -1,11 +1,10 @@
 //! Direct mode — drive `keel-vfs` in-process, no FFI. This is the
-//! fast-iteration path: the same calls go-mtpx's `main.go` exports make, exposed
-//! as the probe subcommands. Every op opens its own session and disposes it,
-//! except `golden` (one scripted session) and `soak` (a transfer loop).
+//! fast-iteration path: the vfs ops exposed as probe subcommands. Every op opens
+//! its own session and disposes it, except `golden` (one scripted session) and
+//! `soak` (a transfer loop).
 //!
-//! The scripted `golden` session is a line-for-line port of Swift
-//! `Probe.runGoldenSession` (Sources/FerryProbe/Probe.swift:131-227): same steps,
-//! same order, same device paths, printing `✓`/`✗` per step.
+//! The scripted `golden` session runs a fixed sequence of ops — same steps, same
+//! order, same device paths — printing `✓`/`✗` per step.
 
 use std::error::Error;
 use std::fs::Metadata;
@@ -21,7 +20,7 @@ use keel_vfs::{FileInfo, ProgressInfo, TransferStatus, VfsError};
 use crate::util::{self, CancelInjector, Rng};
 use crate::{Command, Options};
 
-/// The device staging dir the golden session creates/removes (Probe.swift:160).
+/// The device staging dir the golden session creates/removes.
 const GOLDEN_BASE: &str = "/Download/keel-golden-test";
 /// The device staging dir the soak loop uses.
 const SOAK_BASE: &str = "/Download/keel-soak";
@@ -47,7 +46,7 @@ pub fn run(cmd: Command, opts: &Options) -> Result<(), Box<dyn Error>> {
 // Session helpers
 // ---------------------------------------------------------------------------
 
-/// go-mtpx `Initialize` (device.rs:70) — discover + session ladder.
+/// Initialize the device — discovery + the session recovery ladder.
 fn open(opts: &Options) -> Result<Device, VfsError> {
     device::initialize(Init {
         debug_mode: opts.debug_mode,
@@ -55,7 +54,7 @@ fn open(opts: &Options) -> Result<Device, VfsError> {
 }
 
 /// The storage id to operate on: the `--storage` override, else the first
-/// storage go-mtpx's `FetchStorages` returns (Probe.swift:156 picks `first`).
+/// storage `fetch_storages` returns.
 fn resolve_sid(dev: &mut Device, opts: &Options) -> Result<u32, VfsError> {
     if let Some(s) = opts.storage {
         return Ok(s);
@@ -92,8 +91,8 @@ fn cmd_info(opts: &Options) -> Result<(), Box<dyn Error>> {
     let mut dev = open(opts)?;
     let di = dev.fetch_device_info()?;
     {
-        // usb_info() is set at configure (device.rs:88); borrow after the mutable
-        // fetch_device_info returned its owned value.
+        // usb_info() is populated at configure; borrow it after the mutable
+        // fetch_device_info has returned its owned value.
         let usb = dev.session().usb_info();
         println!("device connected");
         println!("  manufacturer: {}", di.manufacturer);
@@ -133,8 +132,7 @@ fn cmd_walk(path: &str, opts: &Options) -> Result<(), Box<dyn Error>> {
     let mut dev = open(opts)?;
     let sid = resolve_sid(&mut dev, opts)?;
     let mut n = 0u64;
-    // Swift `list` defaults: skipDisallowedFiles=false, skipHiddenFiles=true
-    // (KeelEngine.swift:62-73).
+    // Walk defaults: skipDisallowedFiles=false, skipHiddenFiles=true.
     let (_oid, tf, td) = walk(
         dev.session_mut(),
         sid,
@@ -198,7 +196,7 @@ fn cmd_up(local: &str, remote: &str, opts: &Options) -> Result<(), Box<dyn Error
 fn cmd_down(remote: &str, local: &str, opts: &Options) -> Result<(), Box<dyn Error>> {
     let mut dev = open(opts)?;
     let sid = resolve_sid(&mut dev, opts)?;
-    // os.Create silently overwrites, so ensure the dest dir exists first.
+    // File creation overwrites silently, but the parent dir must exist first.
     if let Some(parent) = std::path::Path::new(local).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -287,8 +285,8 @@ fn cmd_exists(paths: &[String], opts: &Options) -> Result<(), Box<dyn Error>> {
     for (p, r) in paths.iter().zip(results.iter()) {
         println!("  {} {}", if r.exists { "yes" } else { "no " }, p);
     }
-    // FileExists aborts the batch to an empty vec on an unexpected error type
-    // (dirops.rs:153) — surface that rather than silently truncating.
+    // file_exists aborts the batch to an empty vec on an unexpected error type —
+    // surface that rather than silently truncating.
     if results.len() != paths.len() {
         println!(
             "  (batch returned {} of {} results)",
@@ -301,10 +299,10 @@ fn cmd_exists(paths: &[String], opts: &Options) -> Result<(), Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// golden — scripted session mirroring Swift `--golden` (Probe.swift:131-227)
+// golden — scripted session exercising every op end to end
 // ---------------------------------------------------------------------------
 
-/// Run a step, swallow its error (like Swift's `try?`/step wrapper), print ✓/✗.
+/// Run a step, swallow its error, print ✓/✗.
 fn step(name: &str, f: impl FnOnce() -> Result<(), VfsError>) {
     match f() {
         Ok(()) => println!("  ✓ {name}"),
@@ -344,7 +342,7 @@ fn cmd_golden(opts: &Options) -> Result<(), Box<dyn Error>> {
         Ok(())
     });
     if sid == 0 {
-        // Probe.swift:158 — guard sid != 0 else fail.
+        // No usable storage id ⇒ bail.
         println!("  ✗ no storage — is the phone unlocked?");
         dev.dispose();
         return Ok(());
@@ -465,7 +463,7 @@ fn cmd_golden(opts: &Options) -> Result<(), Box<dyn Error>> {
     });
 
     // Step 11: Error-shape fixtures — operations against missing paths. Each
-    // SHOULD fail; the step itself passes (Swift wraps them in try?).
+    // SHOULD fail; the step itself passes (the errors are swallowed).
     step("Error fixtures (expected failures)", || {
         let _ = walk(
             dev.session_mut(),
@@ -521,8 +519,7 @@ fn cmd_golden(opts: &Options) -> Result<(), Box<dyn Error>> {
 fn report_soak(label: &str, res: Result<(i64, i64), VfsError>) {
     match res {
         Ok((f, b)) => println!("  {label} ok: {f} files, {}", util::human_bytes(b)),
-        // The distinct cancelled variant keel-vfs raises on an injected cancel
-        // (upload.rs:184 / download.rs:274).
+        // The distinct cancelled variant keel-vfs raises on an injected cancel.
         Err(VfsError::Cancelled) => println!("  {label} CANCELLED (injected)"),
         Err(e) => println!("  {label} error: {e}"),
     }

@@ -150,15 +150,6 @@ JSON in, callback fn-pointer-as-value in `on_cb_result_t*` position).
 JSON contract, error mapper order, 500 ms sampler, state rules: plan tables
 (keel-ffi section) are normative; `ferry/kernel/send_to_js/*.go` is the
 reference implementation to port line-by-line.
-
-## Go reference sources (read fully before porting your module)
-
-- legacy kernel glue: `/Users/siddharthsuresh/Developer/ferry/kernel/{the legacy kernel,helpers.go,structs.go,utils.go}` + `send_to_js/{main.go,structs.go,helpers.go,enums.go,errors.go,constants.go}`
-- go-mtpx: `$GOMODCACHE/github.com/ganeshrvel/go-mtpx@v0.0.0-20240426092756-18f12db021cc/{main.go,helpers.go,utils.go,structs.go,errors.go,enums.go,const.go}` (+ its `*_test.go` for behavior pinning)
-- go-mtpfs mtp: `$GOMODCACHE/github.com/ganeshrvel/go-mtpfs@v1.0.4-0.20240426083057-1c3302b3c476/mtp/{const.go,encoding.go,types.go,ops.go,mtp.go,android.go,select.go,nullreader.go}` (+ `encoding_test.go`, `device_test.go`)
-- libusb binding (for call-shape reference only): `$GOMODCACHE/github.com/ganeshrvel/usb@v0.0.0-20210103155855-14d96f5ae403/usb.go`
-- `$GOMODCACHE` = `/Users/siddharthsuresh/go/pkg/mod`
-
 Golden fixtures (Go kernel vs real Nothing A059): `keel/fixtures/golden/*.json`
 — the exact payload bytes keel-ffi must reproduce (modulo volatile fields:
 elapsedTime, speed, dates).
